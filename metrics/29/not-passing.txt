@@ -1137,7 +1137,6 @@
 74808 WriteTo_OutStreamOptions_Variants
 74808 WriteTo_OutStream_Variants
 74810 GetValues_Array_Limits
-74810 GetValues_List_Overload
 74810 GetValues_OfSecretHeader
 74811 Secret_Content_Basics
 74811 Secret_Content_Headers

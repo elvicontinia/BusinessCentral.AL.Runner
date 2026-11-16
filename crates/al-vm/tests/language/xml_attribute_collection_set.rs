@@ -46,6 +46,26 @@ codeunit 50320 X
         exit(Str(E));
     end;
 
+    procedure PlainNameOnAnElementInANamespace(): Text
+    var E: XmlElement; C: XmlAttributeCollection; Out: Text;
+    begin
+        E := XmlElement.Create('e', 'urn:e');
+        C := E.Attributes();
+        C.Set('a', '', '1');
+        Out := Str(E);
+        C.Set('a', '', '2');
+        exit(Out + '|' + Str(E) + '|' + Format(C.Count()));
+    end;
+
+    procedure QualifiedNameWithAnEmptyNamespace(): Text
+    var E: XmlElement; C: XmlAttributeCollection;
+    begin
+        E := XmlElement.Create('e', 'urn:e');
+        C := E.Attributes();
+        C.Set('x:a', '', '1');
+        exit(Str(E));
+    end;
+
     procedure ElementInANamespace(): Text
     var E: XmlElement; C: XmlAttributeCollection;
     begin
@@ -82,6 +102,26 @@ fn a_namespace_in_scope_is_refused() {
     let routine = "ElementInANamespace";
     match run_in(SRC, "X", routine) {
         Err(Signal::Unsupported(why)) => assert!(why.contains("prefix"), "{routine}: {why}"),
+        other => panic!("{routine}: expected a refusal, got {other:?}"),
+    }
+}
+
+/// Continia's XML wrapper sets every attribute of a UBL element this way (`CTS-SYS XML Attribute List.SetNamedItem`). As in .NET
+/// `XmlElement.SetAttribute(localName, "", value)`, the attribute has no namespace and no prefix: a default namespace never
+/// applies to an attribute. Not pinned by the corpus (docs/probes-needed.md).
+#[test]
+fn a_plain_name_with_an_empty_namespace_on_an_element_in_a_namespace_has_no_namespace() {
+    assert_eq!(
+        text(run_in(SRC, "X", "PlainNameOnAnElementInANamespace")),
+        r#"<e a="1" xmlns="urn:e" />|<e a="2" xmlns="urn:e" />|1"#
+    );
+}
+
+#[test]
+fn a_qualified_name_with_an_empty_namespace_is_refused() {
+    let routine = "QualifiedNameWithAnEmptyNamespace";
+    match run_in(SRC, "X", routine) {
+        Err(Signal::Unsupported(why)) => assert!(why.contains("qualified name"), "{routine}: {why}"),
         other => panic!("{routine}: expected a refusal, got {other:?}"),
     }
 }

@@ -9,7 +9,10 @@ use al_builtins::assumptions::{Assumption, assume};
 use al_builtins::describe::Describe;
 use al_builtins::http::{fresh_test_response, split_url};
 use al_builtins::native::{HttpOutgoing, Signal, raise, unsupported};
-use al_builtins::value::{LibraryValue, TestHttpRequestState, TestHttpResponseState, Value};
+use al_builtins::value::{
+    HeaderKind, HttpContentState, LibraryValue, TestHttpRequestState, TestHttpResponseState, Value, new_header_list,
+};
+use al_host::network::NetworkRequest;
 use std::cell::RefCell;
 use std::rc::Rc;
 
@@ -95,7 +98,7 @@ impl Session {
                 ),
                 // The request goes out for real, with no approval prompt (corpus bump 43: http/TestHttpClient.al and
                 // lt-cz-http-leads/CzHttpOutbound.al bind no StrMenuHandler).
-                _ => real_request(&request.url),
+                _ => self.real_request(request),
             };
         }
         if !request.url.contains("://") && !matches!(policy, Some("BlockOutboundRequests" | "AllowOutboundFromHandler"))
@@ -160,7 +163,7 @@ impl Session {
                     "NotAllowedHttpClientHandlerFallThrough",
                 );
             }
-            Value::Boolean(true) => return real_request(&request.url),
+            Value::Boolean(true) => return self.real_request(request),
             other => return unsupported(format!("an [HttpClientHandler] that answers {}", other.describe())),
         }
         match resp {
@@ -174,21 +177,86 @@ impl Session {
     }
 }
 
-/// A request that goes out for real: answered only where it fails before any connection
-/// (`al_builtins::http::failure_without_connection`), else refused, since the runtime never opens a connection (ADR-027).
-fn real_request(url: &str) -> Result<TestHttpResponseState, Signal> {
-    match al_builtins::http::failure_without_connection(url) {
-        Some((message, code)) => {
-            let mut failed = fresh_test_response();
-            failed.request_failed = true;
-            failed.failure = Some((message.into(), code.into()));
-            Ok(failed)
+/// The error BC gives a request that reached no server (`al_builtins::http::failure_without_connection`, `.invalid`).
+const NO_CONNECTION: (&str, &str) = (
+    "There was an error while executing the HTTP request. Make sure you are connecting to a valid endpoint.",
+    "HttpRequest:Socket",
+);
+
+/// The headers BC keeps on the response's content rather than on the response (.NET `HttpContentHeaders`).
+const CONTENT_HEADERS: [&str; 10] = [
+    "Allow",
+    "Content-Disposition",
+    "Content-Encoding",
+    "Content-Language",
+    "Content-Length",
+    "Content-Location",
+    "Content-MD5",
+    "Content-Range",
+    "Content-Type",
+    "Expires",
+];
+
+fn failed_response((message, code): (&str, &str)) -> TestHttpResponseState {
+    let mut failed = fresh_test_response();
+    failed.request_failed = true;
+    failed.failure = Some((message.into(), code.into()));
+    failed
+}
+
+impl Session {
+    /// A request that goes out for real. Where it fails before any connection
+    /// (`al_builtins::http::failure_without_connection`) it fails so. Else, with `--allow-network`, the host's network
+    /// sends it and its answer is the response; without, it is refused, since the runtime never opens a connection
+    /// (ADR-027).
+    fn real_request(&self, request: HttpOutgoing) -> Result<TestHttpResponseState, Signal> {
+        if let Some(failure) = al_builtins::http::failure_without_connection(&request.url) {
+            return Ok(failed_response(failure));
         }
-        None => unsupported(
-            "an outbound HTTP request that a test handler does not answer: the runtime never opens a connection (ADR-027). \
-             To run the test, bind an [HttpClientHandler] that answers the request, or set TestHttpRequestPolicy = \
-             BlockOutboundRequests on the test codeunit to get BC's error for it",
-        ),
+        let Some(network) = self.host.network.as_ref() else {
+            return unsupported(
+                "an outbound HTTP request that a test handler does not answer: the runtime never opens a connection (ADR-027). \
+                 To run the test, bind an [HttpClientHandler] that answers the request, set TestHttpRequestPolicy = \
+                 BlockOutboundRequests on the test codeunit to get BC's error for it, or run with --allow-network",
+            );
+        };
+        let sent = network.send(&NetworkRequest {
+            method: request.method,
+            url: request.url,
+            headers: request.payload.headers,
+            body: request.payload.body,
+            timeout_ms: request.payload.timeout_ms,
+        });
+        let Ok(answer) = sent else {
+            return Ok(failed_response(NO_CONNECTION));
+        };
+        let mut response = fresh_test_response();
+        response.status = i32::from(answer.status);
+        response.reason = answer.reason;
+        response.reason_set = true;
+        let content_headers = new_header_list(HeaderKind::Content);
+        for (name, value) in answer.headers {
+            let is_content = CONTENT_HEADERS.iter().any(|h| h.eq_ignore_ascii_case(&name));
+            let bag = if is_content {
+                &content_headers
+            } else {
+                &response.headers
+            };
+            let mut bag = bag.borrow_mut();
+            match bag.items.iter_mut().find(|(n, _)| n.eq_ignore_ascii_case(&name)) {
+                Some((_, values)) => values.push(value),
+                None => bag.items.push((name, vec![value])),
+            }
+        }
+        response.content = Value::Library(
+            "HttpContent".into(),
+            Rc::new(RefCell::new(LibraryValue::HttpContent(HttpContentState {
+                data: answer.body,
+                headers: content_headers,
+                ..HttpContentState::default()
+            }))),
+        );
+        Ok(response)
     }
 }
 

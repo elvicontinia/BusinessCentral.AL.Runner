@@ -555,20 +555,33 @@ fn akv_new(_: &mut Session, _: Option<&Rc<DotNetObject>>, args: Args) -> Result<
     }))))
 }
 
-/// `InitializeFromCallingAppExceptSystemApplication()`: no app has a key vault here, so it raises
-/// `No key vaults specified for extension '<name> by <publisher> <version>'.` (TyAkvProvider.al:84-104; code
-/// AzureKeyVaultAppSecretProvider). The app is the first one on the call stack that is not the System Application.
+/// The state of a provider: empty until it is initialized, then the id and name of the app it serves.
+fn akv_state(this: &Rc<DotNetObject>) -> Result<&RefCell<Vec<Value>>, Signal> {
+    match &this.kind {
+        DotNetKind::Internal { type_name, state } if type_name == AKV_PROVIDER => Ok(state),
+        _ => Err(Signal::Unsupported(
+            "DotNet AzureKeyVaultAppSecretProvider member on something the runtime did not make".into(),
+        )),
+    }
+}
+
+/// `InitializeFromCallingAppExceptSystemApplication()`. The app is the first one on the call stack that is not the
+/// System Application. When `--app-secrets` gave that app secrets, the provider serves them. Otherwise the app has no
+/// key vault, so it raises `No key vaults specified for extension '<name> by <publisher> <version>'.`
+/// (TyAkvProvider.al:84-104; code AzureKeyVaultAppSecretProvider) and stays not initialized.
 fn akv_initialize(s: &mut Session, this: Option<&Rc<DotNetObject>>, args: Args) -> Result<Value, Signal> {
     no_args(
         args,
         "AzureKeyVaultAppSecretProvider.InitializeFromCallingAppExceptSystemApplication",
     )?;
-    if this.is_none() {
+    let Some(this) = this else {
         return Err(Signal::Unsupported(
             "DotNet AzureKeyVaultAppSecretProvider.InitializeFromCallingAppExceptSystemApplication on a variable never constructed (not pinned; only TryGetAzureKeyVaultSecret is)"
                 .into(),
         ));
-    }
+    };
+    let state = akv_state(this)?;
+    state.borrow_mut().clear();
     // Pinned by tests/al-language-onprem-dotnet/dotnet/dotnet/TyAkvProvider.al TY_Akv_Construct_Initialize, TY_Akv_TryGetSecret_NoInitialize (was assumption `akv-provider-no-key-vault`).
     let program = &s.engine.program;
     let app = s
@@ -583,6 +596,18 @@ fn akv_initialize(s: &mut Session, this: Option<&Rc<DotNetObject>>, args: Args) 
                 .into(),
         ));
     };
+    let has_secrets = s
+        .host
+        .app_secrets
+        .as_ref()
+        .is_some_and(|secrets| secrets.of_app(&app.id, &app.name).is_some());
+    if has_secrets {
+        *state.borrow_mut() = vec![
+            Value::Text(app.id.as_str().into()),
+            Value::Text(app.name.as_str().into()),
+        ];
+        return Ok(Value::Null);
+    }
     al_builtins::native::raise(
         format!(
             "No key vaults specified for extension '{} by {} {}'.",
@@ -592,9 +617,11 @@ fn akv_initialize(s: &mut Session, this: Option<&Rc<DotNetObject>>, args: Args) 
     )
 }
 
-/// `TryGetAzureKeyVaultSecret(name, var value)`: the provider never initializes, so it raises `Not initialized.`
-/// and leaves the out value as it was (TyAkvProvider.al:108-120).
-fn akv_try_get(s: &mut Session, this: Option<&Rc<DotNetObject>>, _: Args) -> Result<Value, Signal> {
+/// `TryGetAzureKeyVaultSecret(name, var value)`. Before a successful initialize it raises `Not initialized.` and
+/// leaves the out value as it was (TyAkvProvider.al:108-120). After one, a name the app's secrets map answers true
+/// and the value; any other name answers false and '' (System Application "App Key Vault Secret Pr. Impl."
+/// GetSecret: "It will return false in these cases, and set SecretValue=''").
+fn akv_try_get(s: &mut Session, this: Option<&Rc<DotNetObject>>, args: &mut [Value]) -> Result<Value, Signal> {
     // Pinned by tests/al-language-onprem-dotnet/dotnet/dotnet/TyAkvProvider.al TY_Akv_Construct_Initialize, TY_Akv_TryGetSecret_NoInitialize (was assumption `akv-provider-no-key-vault`).
     if this.is_none() {
         // A variable never constructed (TyAkvProvider.al:140-152, TY_Akv_TryGetSecret_NotConstructed): the error names the
@@ -621,7 +648,27 @@ fn akv_try_get(s: &mut Session, this: Option<&Rc<DotNetObject>>, _: Args) -> Res
             "DotNetVariableNotCreated",
         );
     }
-    al_builtins::native::raise("Not initialized.", "AzureKeyVaultAppSecretProvider")
+    let served = this
+        .map(akv_state)
+        .transpose()?
+        .map(|st| st.borrow().clone())
+        .unwrap_or_default();
+    let [Value::Text(app_id), Value::Text(app_name)] = served.as_slice() else {
+        return al_builtins::native::raise("Not initialized.", "AzureKeyVaultAppSecretProvider");
+    };
+    let [Value::Text(name) | Value::Code(name), out] = args else {
+        return Err(Signal::Unsupported(
+            "DotNet AzureKeyVaultAppSecretProvider.TryGetAzureKeyVaultSecret takes (Text, var Text)".into(),
+        ));
+    };
+    let value = s
+        .host
+        .app_secrets
+        .as_ref()
+        .and_then(|secrets| secrets.of_app(app_id, app_name))
+        .and_then(|app| app.get(name.as_str()).cloned());
+    *out = Value::Text(value.clone().unwrap_or_default().into());
+    Ok(Value::Boolean(value.is_some()))
 }
 
 const ENV_PROBE: &str = "probe tests/al-language/session-system/TestEnvironmentUserTenantContracts.al";
@@ -1035,7 +1082,7 @@ fn own_types() -> Vec<RegistryType> {
                     Pin::Corpus(AKV_PIN.into()),
                     akv_initialize,
                 ),
-                member("TryGetAzureKeyVaultSecret", Pin::Corpus(AKV_PIN.into()), akv_try_get),
+                member_ref("TryGetAzureKeyVaultSecret", Pin::Corpus(AKV_PIN.into()), akv_try_get),
             ],
         },
         RegistryType {

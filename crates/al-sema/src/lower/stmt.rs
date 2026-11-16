@@ -1312,6 +1312,9 @@ impl Lowerer<'_> {
         for k in kids.iter().take(2) {
             self.security_filtering_array_refusal(k, "an array assignment")?;
         }
+        if let Some(stmt) = self.assign_to_returned_record(&kids[0], &kids[1])? {
+            return Ok(stmt);
+        }
         // `CurrFieldNo := FieldNo(X)` in table code sets the field number of the implicit Rec. Base Application's
         // `SelltoContactLookup` does it before it validates a field. The corpus pins reading CurrFieldNo
         // (testpage/TestPageCurrFieldNo_Tests.al); the assignment is not pinned (docs/probes-needed.md).

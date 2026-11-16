@@ -197,6 +197,7 @@ mod recordref_property_assign;
 mod recordref_system_id_no;
 mod relation_blank_member;
 mod relation_error_ext_caption;
+mod returned_record_field_assign;
 mod round_date2dmy_errors;
 mod run_on_client;
 mod self_unbind;

@@ -632,6 +632,7 @@ mod object_hash_tests;
 mod page_client_expr;
 mod pages;
 mod request_procs;
+mod returned_record;
 mod routine_lists;
 mod shared;
 mod stmt;

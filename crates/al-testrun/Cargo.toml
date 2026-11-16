@@ -19,6 +19,7 @@ al-cache.workspace = true
 sha2 = "0.10"
 rayon = "1"
 al-syntax.workspace = true
+ureq = { version = "3", default-features = false, features = ["rustls"] }
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
