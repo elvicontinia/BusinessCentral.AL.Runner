@@ -121,6 +121,19 @@ pub fn uses_network() -> bool {
     NETWORK.get().is_some()
 }
 
+/// `--skip-partner-login`: the partner dependency apps' login subscribers do not run in the test session.
+static SKIP_PARTNER_LOGIN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Leaves out the partner dependency apps' `OnAfterLogin` subscribers in the test session (`--skip-partner-login`).
+pub fn set_skip_partner_login() {
+    SKIP_PARTNER_LOGIN.store(true, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Whether the partner dependency apps' login subscribers are left out ([`set_skip_partner_login`]).
+pub fn skips_partner_login() -> bool {
+    SKIP_PARTNER_LOGIN.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 /// The environment `--environment` named. Set once at start-up; the default is the probed SaaS-like sandbox.
 static ENVIRONMENT: OnceLock<al_host::Environment> = OnceLock::new();
 

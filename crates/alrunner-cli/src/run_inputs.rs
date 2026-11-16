@@ -183,6 +183,7 @@ impl RunInputs {
             files_dir,
             app_secrets,
             allow_network,
+            skip_partner_login,
             license,
             environment,
             companies,
@@ -296,6 +297,8 @@ impl RunInputs {
         r.outcome.push(("files_dir", text(&file_name(files_dir))));
         // Whether a request no handler answers is sent or refused.
         r.outcome.push(("allow_network", text(allow_network)));
+        // Whether the partner dependency apps' login subscribers run in the test session.
+        r.outcome.push(("skip_partner_login", text(skip_partner_login)));
         // What App Key Vault Secret Provider answers. Hashed by content, as the license: a key holds no value.
         r.content.push(Content {
             name: "app_secrets",
@@ -443,7 +446,7 @@ mod tests {
     type Change = fn(&mut TestArgs, &Path);
 
     /// One change per outcome input, by the name `RunInputs::of` gives it. The path is a file that exists.
-    const CHANGES: [(&str, Change); 44] = [
+    const CHANGES: [(&str, Change); 45] = [
         ("country", |a, _| a.country = Some("de".into())),
         ("bc_version", |a, _| a.bc_version = Some("27.5".into())),
         ("isolation", |a, _| {
@@ -486,6 +489,7 @@ mod tests {
         ("files_dir", |a, f| a.files_dir = Some(f.to_path_buf())),
         ("app_secrets", |a, f| a.app_secrets = Some(f.to_path_buf())),
         ("allow_network", |a, _| a.allow_network = true),
+        ("skip_partner_login", |a, _| a.skip_partner_login = true),
         ("license", |a, f| a.license = Some(f.to_path_buf())),
         ("environment", |a, _| a.environment = Some(al_host::Environment::OnPrem)),
         ("companies", |a, _| a.companies = Some(al_host::Companies::All)),

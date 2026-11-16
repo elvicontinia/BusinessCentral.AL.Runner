@@ -203,6 +203,8 @@ pub struct TestArgs {
     pub app_secrets: Option<PathBuf>,
     /// `--allow-network`: a request that no test handler answers goes out for real instead of being refused.
     pub allow_network: bool,
+    /// `--skip-partner-login`: the partner dependency apps' `OnAfterLogin` subscribers do not run in the test session.
+    pub skip_partner_login: bool,
     /// `--license FILE` (serve: `license`): the BC license the run uses instead of the BC artifacts' (ADR-060).
     pub license: Option<PathBuf>,
     /// `--environment saas|onprem`: what Environment Information answers (default saas, as probed).
@@ -1219,6 +1221,9 @@ OTHER
                          The file is read for this run only; the install baseline is not kept on
                          disk, and no value is printed. Fill the file from the vault in the
                          pipeline and delete it after the run.
+    --skip-partner-login Do not run the OnAfterLogin subscribers of partner dependency apps in the test
+                         session (BC runs them). For partner apps whose login code changes state the
+                         runner cannot watch; every test of such a run is flagged.
     --allow-network      Send a request that no [HttpClientHandler] answers to the real server
                          (default: refused, the test is not run). The test then depends on that
                          server: its outcome can change between runs. The install baseline is not
@@ -1691,6 +1696,7 @@ pub fn parse(args: impl IntoIterator<Item = String>) -> Result<Command, String> 
             "--files-dir" => a.files_dir = Some(text()?.into()),
             "--app-secrets" => a.app_secrets = Some(text()?.into()),
             "--allow-network" => a.allow_network = true,
+            "--skip-partner-login" => a.skip_partner_login = true,
             "--license" => a.license = Some(text()?.into()),
             "--environment" => a.environment = Some(text()?.parse().map_err(|e| format!("--environment: {e}"))?),
             "--companies" => {

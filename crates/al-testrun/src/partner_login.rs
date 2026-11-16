@@ -103,6 +103,15 @@ pub(crate) fn subscribers(
         return Vec::new();
     }
     let objs = &lowered.program.objects;
+    if crate::host::skips_partner_login() {
+        // BC runs them; a run with `--skip-partner-login` does not (assumption `skip-partner-login`).
+        let left_out = (crate::login::after_login_subscribers(lowered, events).iter())
+            .any(|&(o, _)| lowered.dependency[o] && crate::install_orders::is_partner(lowered, objs[o].app));
+        if left_out {
+            al_builtins::assumptions::assume(al_builtins::assumptions::Assumption::SkipPartnerLogin);
+        }
+        return Vec::new();
+    }
     (crate::login::after_login_subscribers(lowered, events).iter().copied())
         .filter(|&(o, _)| lowered.dependency[o] && crate::install_orders::is_partner(lowered, objs[o].app))
         .collect()

@@ -1081,6 +1081,12 @@ fn test_inner(
         }
         al_testrun::host::set_network(std::sync::Arc::new(al_testrun::network::UreqNetwork::new()));
     }
+    if a.skip_partner_login {
+        if !a.quiet {
+            eprintln!("login: the partner dependency apps' OnAfterLogin subscribers do not run (--skip-partner-login)");
+        }
+        al_testrun::host::set_skip_partner_login();
+    }
     // Fail on an unwritable output path before the long part, not after it.
     if let Some(p) = &a.junit {
         write_file(p, "")?;
