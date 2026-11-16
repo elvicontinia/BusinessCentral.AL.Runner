@@ -21,6 +21,7 @@ use std::sync::OnceLock;
 
 type Rec = Rc<RefCell<RecordState>>;
 mod fieldref_arg;
+mod fieldref_setrange_text;
 mod open_target;
 
 type Lib = Rc<RefCell<LibraryValue>>;
@@ -1735,6 +1736,9 @@ impl Session {
                 self.media_fieldref_filter_argument(method, &field.ty, args)?;
                 let mut a = vec![Value::Integer(pos as i32)];
                 a.extend(args.iter().cloned());
+                if method == "SetRange" {
+                    self.fieldref_setrange_scalars_as_text(&field.ty, &mut a[1..])?;
+                }
                 self.record_op_from_al(record_method(method), &rec, &mut a)
             }
             other => unsupported(format!("FieldRef.{other}")),
