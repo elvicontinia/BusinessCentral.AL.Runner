@@ -11,6 +11,7 @@ mod generic_dictionary;
 mod generic_dictionary_more;
 mod gettype;
 pub(crate) mod instream_arg;
+mod invoke_exception;
 mod last_error;
 mod not_created;
 mod pinned_exceptions;
@@ -21,12 +22,14 @@ mod business_chart_data;
 mod key_vault;
 mod query_metadata;
 pub mod registry;
+mod rendered;
 pub mod server_classes;
 mod server_helpers;
 mod staged_dir;
 mod system_environment;
 mod xml_errors;
 mod zip_entry_streams;
+mod zone_rules;
 
 use crate::{Frame, Session};
 use al_builtins::describe::Describe;
@@ -61,6 +64,12 @@ pub struct DotNetConfig {
     pub host: Arc<dyn DotNetHost>,
     pub registry: Arc<Registry>,
     pub policy: Arc<Policy>,
+    /// BC's own Word merger and document converter (ADR-040 amendments 2026-11-13b and 2026-11-15), run by a front end;
+    /// `NoRenderer` when the run has none. Which saves ask it is `crate::report_render`'s gate.
+    pub renderer: Arc<dyn al_host::render::ReportRenderer>,
+    /// `--require-report-renderer`: a save whose real output needs `renderer` refuses when it is unavailable, instead of
+    /// keeping the output it has without one.
+    pub require_renderer: bool,
 }
 
 impl Default for DotNetConfig {
@@ -69,6 +78,8 @@ impl Default for DotNetConfig {
             host: Arc::new(al_host::dotnet::NoDotNet),
             registry: Arc::new(Registry::builtin()),
             policy: Arc::new(Policy::builtin()),
+            renderer: Arc::new(al_host::render::NoRenderer),
+            require_renderer: false,
         }
     }
 }
@@ -116,6 +127,41 @@ pub struct DotNetState {
 }
 
 impl DotNetState {
+    /// Holds what a new session holds (`install_left.rs`): no host session started and nothing noted. Every field is
+    /// named: a new one does not compile here until it is decided.
+    pub(crate) fn as_new(&self) -> bool {
+        let DotNetState {
+            session,
+            release,
+            available,
+            bridges,
+            open_workbooks,
+            closed_workbooks,
+            worksheets,
+            workbook_readers,
+            worksheet_readers,
+            cleared,
+            entry_streams,
+            result_ty,
+            null_string,
+            password_rng,
+        } = self;
+        session.is_none()
+            && release.borrow().is_empty()
+            && available.is_none()
+            && bridges.is_empty()
+            && open_workbooks.is_empty()
+            && closed_workbooks.is_empty()
+            && worksheets.is_empty()
+            && workbook_readers.is_empty()
+            && worksheet_readers.is_empty()
+            && cleared.is_empty()
+            && entry_streams.is_empty()
+            && result_ty.is_none()
+            && !null_string
+            && password_rng.is_none()
+    }
+
     pub(crate) fn clear_null_string(&mut self) {
         self.null_string = false;
     }
@@ -456,13 +502,9 @@ impl Session {
         {
             let blob = al_builtins::stream::new_blob();
             save_to = Some((p.to_string(), blob.clone()));
-            values[0] = Value::Library(
-                al_builtins::library_kind::LibraryKind::OutStream,
-                std::rc::Rc::new(std::cell::RefCell::new(LibraryValue::OutStream(
-                    blob,
-                    al_builtins::stream::Encoding::default(),
-                ))),
-            );
+            let out = LibraryValue::OutStream(blob, al_builtins::stream::Encoding::default(), None);
+            let out = std::rc::Rc::new(std::cell::RefCell::new(out));
+            values[0] = Value::Library(al_builtins::library_kind::LibraryKind::OutStream, out);
         }
 
         // ADR-056: outside the company build, .NET reads and writes files only in the session's in-memory file system.
@@ -481,18 +523,7 @@ impl Session {
         }
 
         // 2. The host provider, after the policy (ADR-014 section 8).
-        let assembly = match &target {
-            Target::Static(d) => Some(d.assembly.as_str()),
-            _ => None,
-        };
-        let access = if kind == MemberKind::Construct {
-            Access::Construct(values.len())
-        } else if values.iter().any(|v| matches!(v, Value::Text(_) | Value::Code(_))) {
-            Access::MemberWithText(&member)
-        } else {
-            Access::Member(&member)
-        };
-        if let Err(why) = engine.dotnet.policy.check(assembly, &clr_type, access) {
+        if let Err(why) = self.policy_check(&engine.dotnet.policy, &target, &clr_type, &member, kind, &values) {
             return unsupported(format!("DotNet {shown}: {why}"));
         }
         if matches!(target, Target::Internal(..)) {
@@ -552,6 +583,7 @@ impl Session {
                 }
                 if let Some((path, blob)) = save_to {
                     let bytes = blob.borrow().bytes.clone();
+                    self.placeholder_files.written(&path);
                     // A document holding content carried unread (owner decision 2026-10-23 "Carry bytes unread": the
                     // DemoTool's RapidStart package with a re-encoded or re-zipped media) is saved as a marked file.
                     let wrote = if self.company_build && holds_carried_text(&bytes) {
@@ -581,6 +613,10 @@ impl Session {
                     &values,
                     &e,
                 )?;
+                let streams = book.ins.len() + book.outs.len();
+                if let Some(error) = invoke_exception::signal(kind, &target, &clr_type, &member, streams, &e) {
+                    return Err(error);
+                }
                 let inner: String = e.inner.iter().map(|(t, m)| format!(" <- {t}: {m}")).collect();
                 unsupported(format!(
                     "DotNet {shown} raised the .NET exception {}: {}{inner}; the text AL would see is not pinned (ADR-014 section 7)",
@@ -681,7 +717,7 @@ impl Session {
             let blob = al_builtins::stream::new_blob();
             *(if create_book { open_workbook } else { save_to }) = Some((path.to_string(), blob.clone()));
             values[0] = lib(
-                LibraryValue::OutStream(blob, al_builtins::stream::Encoding::default()),
+                LibraryValue::OutStream(blob, al_builtins::stream::Encoding::default(), None),
                 al_builtins::library_kind::LibraryKind::OutStream,
             );
             return Ok(());
@@ -760,7 +796,7 @@ impl Session {
         Ok(())
     }
 
-    /// Whether `Clear` of a DotNet variable holding `handle` only unassigns it: a workbook writer `WorkbookWriter.Create(fileName)`
+    /// Whether `Clear` of a DotNet variable holding `handle` only unassigns it: an object of a type in [`CLEAR_ONLY_UNASSIGNS`], a workbook writer `WorkbookWriter.Create(fileName)`
     /// made, after its `Close` or `Dispose`, or a worksheet writer it handed out while open (Excel Buffer.CloseBook; assumption
     /// clear-closed-workbook-writer). Before the Close a Dispose could change what Close writes, which is not pinned.
     /// A workbook reader `WorkbookReader.Open` made, or a worksheet reader it handed out (Excel Buffer.CloseBook after ReadSheet;
@@ -768,6 +804,9 @@ impl Session {
     /// end when it was handed to .NET. Another variable may still hold the object: a later call on it is refused (`cleared`).
     pub(crate) fn dotnet_clear_is_inert(&mut self, handle: DotNetHandle, clr_type: &str) -> bool {
         use al_builtins::assumptions::{Assumption, assume};
+        if CLEAR_ONLY_UNASSIGNS.iter().any(|t| clr_type.eq_ignore_ascii_case(t)) {
+            return true;
+        }
         let dn = &self.dotnet;
         let (inert, why) = if clr_type.eq_ignore_ascii_case(WORKBOOK_WRITER) {
             (
@@ -827,9 +866,12 @@ impl Session {
                 Ok(Value::Boolean(found))
             }
             // File Management.DeleteServerFile deletes a file it found (QxDotNetDemoShapes.al:326-328). Deleting a file that
-            // is not there is not pinned.
+            // is not there is not pinned. A file that holds a placeholder report output: `dotnet_delete_placeholder_file`
+            // (Base Application's e-mail body round trip through a server file; assumption dotnet-file-delete-placeholder).
             ("system.io.file", "delete", []) => {
-                self.refuse_pending_file(path)?;
+                if !self.dotnet_delete_placeholder_file(path)? {
+                    self.refuse_pending_file(path)?;
+                }
                 if self.host.files.remove(path) {
                     Ok(Value::Null)
                 } else {
@@ -1141,7 +1183,7 @@ impl Session {
                     return unsupported(format!("DotNet {clr_type}: {why}"));
                 }
                 let blob = match &*h.borrow() {
-                    LibraryValue::OutStream(blob, _) => blob.clone(),
+                    LibraryValue::OutStream(blob, ..) => blob.clone(),
                     other => {
                         return unsupported(format!("CopyStream from a DotNet stream into {}", other.describe()));
                     }
@@ -1413,7 +1455,7 @@ impl Session {
                         at: st.pos.min(st.len()),
                     }
                 }
-                LibraryValue::OutStream(blob, _) => {
+                LibraryValue::OutStream(blob, ..) => {
                     book.outs.push((arg, blob.clone()));
                     // BC hands .NET the Blob's own stream: a ZipArchive in Read mode over an OutStream AL copied a zip into reads
                     // that zip (corpus tests/al-language-onprem-dotnet/dotnet/dotnet/WdZipArchiveOverOutStream.al:77-96
@@ -1660,6 +1702,34 @@ fn boxed_clr_type(v: &Value) -> Option<&'static str> {
     })
 }
 
+impl Session {
+    /// Step 2 of the router: the policy (ADR-014 section 8), then the zone checks that also need the arguments
+    /// (`zone_rules.rs`). `Err` is the refusal reason.
+    fn policy_check(
+        &self,
+        policy: &Policy,
+        target: &Target,
+        clr_type: &str,
+        member: &str,
+        kind: MemberKind,
+        values: &[Value],
+    ) -> Result<(), String> {
+        let assembly = match target {
+            Target::Static(d) => Some(d.assembly.as_str()),
+            _ => None,
+        };
+        let access = if kind == MemberKind::Construct {
+            Access::Construct(values.len())
+        } else if values.iter().any(|v| matches!(v, Value::Text(_) | Value::Code(_))) {
+            Access::MemberWithText(member)
+        } else {
+            Access::Member(member)
+        };
+        policy.check(assembly, clr_type, access)?;
+        self.zone_rules_check(policy, clr_type, member, target, values)
+    }
+}
+
 fn host_target(t: &Target) -> DotNetTarget {
     match t {
         Target::Static(d) => DotNetTarget::Static(d.clone()),
@@ -1772,6 +1842,17 @@ const WORKBOOK_WRITER: &str = "Microsoft.Dynamics.Nav.OpenXml.Spreadsheet.Workbo
 const WORKBOOK_READER: &str = "Microsoft.Dynamics.Nav.OpenXml.Spreadsheet.WorkbookReader";
 const WORKSHEET_WRITER: &str = "Microsoft.Dynamics.Nav.OpenXml.Spreadsheet.WorksheetWriter";
 const WORKSHEET_READER: &str = "Microsoft.Dynamics.Nav.OpenXml.Spreadsheet.WorksheetReader";
+
+/// The types whose `Clear` only unassigns the variable: the object is not disposed, and another variable or an object that holds
+/// it keeps using it. A Reference after Clear: IsNull, still counted in the SignedXml it was added to, a second variable reads its
+/// Uri and transforms, Clear twice is fine (al-language-onprem-dotnet dotnet/dotnet/ClearSignedXmlReference.al:144-180, steps 1, 2,
+/// 3 and 7, AL Runner issue 7394; System Application's "SignedXml Impl." clears its Reference after AddReference). A SignedXml
+/// after Clear: a second variable still computes the signature (:157-167, step 5). Clear of the RSA key disposes it (:151-152, step
+/// 6), so key types are not listed.
+const CLEAR_ONLY_UNASSIGNS: &[&str] = &[
+    "System.Security.Cryptography.Xml.Reference",
+    "System.Security.Cryptography.Xml.SignedXml",
+];
 
 fn opens_file_by_path(clr_type: &str, member: &str, kind: MemberKind) -> bool {
     let t = clr_type.to_ascii_lowercase();

@@ -204,6 +204,8 @@ pub struct MemStore {
     /// While set, the tables whose access is watched and the first one that was read or written ([`MemStore::watch`]).
     /// Shared by the clones of the store, so a snapshot, a restore or a rollback does not lose it.
     watch: Option<std::rc::Rc<std::cell::RefCell<Watch>>>,
+    /// The store stands for the database ([`MemStore::as_database`]): a Decimal it keeps carries no trailing zeros.
+    database: bool,
 }
 
 /// The tables [`MemStore::watch`] watches and the first of them that was read or written, and the window open on top
@@ -596,6 +598,27 @@ impl MemStore {
         }
     }
 
+    /// This store as the database: a row it keeps holds each Decimal without trailing zeros, as BC reads a row back from
+    /// SQL (reports/dataset/DatasetDecimalPlacesValueOrigins.al:495-510: the stored `1.50` read by `Get` is `1.5`, times
+    /// two `3.0`; :535-550: a FlowField summed over the rows `1` and `1.50` is `2.5`; :241-247: a data item's row read
+    /// back from `1.00000` gives `D05 * 1` = `1`). A temporary table stays in memory and keeps the values as written.
+    pub fn as_database(mut self) -> MemStore {
+        self.database = true;
+        self
+    }
+
+    /// `row` as this store keeps it ([`MemStore::as_database`]).
+    fn kept(&self, mut row: Row) -> Row {
+        if self.database {
+            for v in row.iter_mut() {
+                if let Value::Decimal(d) = v {
+                    *d = d.normalize();
+                }
+            }
+        }
+        row
+    }
+
     /// This store with `b` as the rows its untouched tables read.
     pub fn with_backing(mut self, b: std::rc::Rc<dyn Backing>) -> MemStore {
         self.backing = Some(b);
@@ -716,6 +739,120 @@ impl MemStore {
             .unwrap_or_default()
     }
 
+    /// Whether the row of table `t` under primary key `key` has a field at position `pos` that satisfies `holds`: one lookup,
+    /// no row copied. Counts no store operation (`bump`): the VM's check of who holds a temporary row's Blob buffer is no
+    /// record method of AL code, and the SQL counters (al-vm `sqlcount.rs`) must not see it.
+    pub fn row_field_holds(
+        &self,
+        cx: &AccessContext,
+        t: &TableDef,
+        key: &[Value],
+        pos: usize,
+        holds: impl Fn(&Value) -> bool,
+    ) -> bool {
+        self.table(cx, t)
+            .is_some_and(|tb| tb.get(&Key::of(t, key.to_vec())).is_some_and(|row| holds(&row[pos])))
+    }
+
+    /// The rows of table `t` that have a field at position `pos` that satisfies `holds`, stopping at `enough` of them: whether
+    /// the row under primary key `key` is one, and how many others are. The row under `first` is looked up first, unless it is
+    /// the last row; the others are counted from the last row in primary key order back to the first. Counts no store operation, as
+    /// [`MemStore::row_field_holds`].
+    #[allow(clippy::too_many_arguments)]
+    pub fn field_holders_from_last(
+        &self,
+        cx: &AccessContext,
+        t: &TableDef,
+        key: &[Value],
+        first: Option<&[Value]>,
+        pos: usize,
+        enough: usize,
+        holds: impl Fn(&Value) -> bool,
+    ) -> (bool, usize) {
+        let (mut at_key, mut others) = (false, 0);
+        if enough == 0 {
+            return (at_key, others);
+        }
+        let Some(tb) = self.table(cx, t) else {
+            return (at_key, others);
+        };
+        let key = Key::of(t, key.to_vec());
+        // The last row is the walk's first: no lookup for it.
+        let last = tb.iter().next_back().map(|(k, _)| k);
+        let first = first
+            .map(|f| Key::of(t, f.to_vec()))
+            .filter(|f| *f != key && Some(f) != last);
+        if let Some(f) = &first
+            && tb.get(f).is_some_and(|row| holds(&row[pos]))
+        {
+            others = 1;
+            if others == enough {
+                return (at_key, others);
+            }
+        }
+        for (k, row) in tb.iter().rev() {
+            if first.as_ref() == Some(k) {
+                continue;
+            }
+            if holds(&row[pos]) {
+                if *k == key {
+                    at_key = true;
+                } else {
+                    others += 1;
+                }
+                if usize::from(at_key) + others == enough {
+                    break;
+                }
+            }
+        }
+        (at_key, others)
+    }
+
+    /// How many rows of table `t` other than the one under primary key `skip` have a field at position `pos` that satisfies
+    /// `holds`, stopping at `enough`. The row under `first` is looked up first, unless it is the last row; the others are
+    /// counted from the last row in primary key order back to the first. Counts no store operation, as [`MemStore::row_field_holds`].
+    #[allow(clippy::too_many_arguments)]
+    pub fn count_field_holders_from_last(
+        &self,
+        cx: &AccessContext,
+        t: &TableDef,
+        skip: &[Value],
+        first: Option<&[Value]>,
+        pos: usize,
+        enough: usize,
+        holds: impl Fn(&Value) -> bool,
+    ) -> usize {
+        if enough == 0 {
+            return 0;
+        }
+        let Some(tb) = self.table(cx, t) else {
+            return 0;
+        };
+        let skip = Key::of(t, skip.to_vec());
+        let last = tb.iter().next_back().map(|(k, _)| k);
+        let first = first
+            .map(|f| Key::of(t, f.to_vec()))
+            .filter(|f| *f != skip && Some(f) != last);
+        let mut n = 0;
+        if let Some(f) = &first
+            && tb.get(f).is_some_and(|row| holds(&row[pos]))
+        {
+            n = 1;
+            if n == enough {
+                return n;
+            }
+        }
+        for (k, row) in tb.iter().rev() {
+            if *k != skip && first.as_ref() != Some(k) && holds(&row[pos]) {
+                n += 1;
+                if n == enough {
+                    break;
+                }
+            }
+        }
+        n
+    }
+
     /// The provider of table `t`, if its rows are computed.
     fn virtual_of(&self, t: &TableDef) -> Option<&dyn VirtualTables> {
         self.virtuals.as_deref().filter(|v| v.serves(t))
@@ -750,6 +887,16 @@ impl MemStore {
     pub fn written_since_commit(&self, cx: &AccessContext, t: &TableDef) -> bool {
         let slot = slot(cx, t);
         self.versions.get(&slot) != self.committed_versions.get(&slot)
+    }
+
+    /// The table objects (in any company) that a write after the change counter was `counter` changed, and that neither a
+    /// commit kept nor a rollback undid: the tables whose rows of those writes a rollback now takes back.
+    pub fn tables_rolled_back_since(&self, counter: u64) -> std::collections::BTreeSet<u32> {
+        self.versions
+            .iter()
+            .filter(|(slot, v)| **v > counter && self.committed_versions.get(slot) != Some(*v))
+            .map(|((_, object), _)| *object)
+            .collect()
     }
 
     /// Whether any write since the last commit or rollback is pending.
@@ -807,9 +954,14 @@ impl MemStore {
         }
     }
 
-    /// Closes the window of [`MemStore::watch_window`]: the first of its tables accessed while it was open, if any.
+    /// Closes the window of [`MemStore::watch_window`]: the first of its tables accessed while it was open, if any. A watch
+    /// that only held the window ends with it.
     pub fn watch_window_end(&mut self) -> Option<u32> {
-        self.watch.as_ref()?.borrow_mut().window.take()?.1
+        let hit = self.watch.as_ref()?.borrow_mut().window.take()?.1;
+        if self.watch.as_ref().is_some_and(|w| w.borrow().tables.is_empty()) {
+            self.watch = None;
+        }
+        hit
     }
 
     /// Notes an access to table `object` for the watch.
@@ -1465,6 +1617,7 @@ pub fn store_ops() -> u64 {
 impl Store for MemStore {
     fn insert(&mut self, cx: &AccessContext, t: &TableDef, row: Row) -> Result<InsertOutcome, StoreError> {
         bump();
+        let row = self.kept(row);
         t.check_key_values(&row)?;
         if let Some(v) = self.virtual_of(t) {
             if !v.takes_inserts(t) {
@@ -1502,10 +1655,11 @@ impl Store for MemStore {
 
     fn modify(&mut self, cx: &AccessContext, t: &TableDef, row: Row) -> Result<WriteOutcome, StoreError> {
         bump();
+        let row = self.kept(row);
         t.check_key_values(&row)?;
         if let Some(v) = self.virtual_of(t) {
             let k = Key::of(t, t.primary_key(&row));
-            if v.takes_inserts(t) && self.table(cx, t).is_some_and(|m| m.contains_key(&k)) {
+            if v.modifies_stored_rows(t) && self.table(cx, t).is_some_and(|m| m.contains_key(&k)) {
                 self.table_mut(cx, t).insert(k, row);
                 self.touch(cx, t);
                 return Ok(WriteOutcome::Done);
@@ -1607,6 +1761,7 @@ impl Store for MemStore {
         row: Row,
     ) -> Result<RenameOutcome, StoreError> {
         bump();
+        let row = self.kept(row);
         t.check_primary_key(old)?;
         t.check_key_values(&row)?;
         if self.virtual_of(t).is_some() {
@@ -1869,14 +2024,48 @@ impl SnapshotStore for MemStore {
     fn restore(&mut self, s: MemStore) {
         bump();
         let counter = self.counter.max(s.counter);
+        // Whether the store stands for the database is its role, not part of the rows a snapshot holds.
+        let database = self.database;
         *self = s;
         self.counter = counter;
+        self.database = database;
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // Review of al-runner PR 8119: the test runner asks which tables install code wrote since it started that a rollback
+    // now takes back: not a write before it started, nor one it committed.
+    #[test]
+    fn the_store_tells_which_tables_a_rollback_takes_back_of_the_writes_since_a_mark() {
+        use crate::contract::{cx, row, table};
+        let c = cx("C");
+        let at = |object| {
+            let mut t = table();
+            t.object = object;
+            t
+        };
+        let mut s = MemStore::default();
+        s.insert(&c, &at(1), row("A", 1, 1)).unwrap();
+        let mark = s.change_counter();
+        s.insert(&c, &at(2), row("A", 1, 1)).unwrap();
+        assert_eq!(
+            s.tables_rolled_back_since(mark),
+            [2].into(),
+            "a write before the mark is not counted"
+        );
+        s.commit();
+        assert!(
+            s.tables_rolled_back_since(mark).is_empty(),
+            "a committed write is not taken back"
+        );
+        s.insert(&c, &at(3), row("A", 1, 1)).unwrap();
+        assert_eq!(s.tables_rolled_back_since(mark), [3].into());
+        s.rollback();
+        assert!(s.tables_rolled_back_since(mark).is_empty());
+    }
 
     // al-runner issue 5641: the test runner asks which tables a Company Triggers subscriber wrote while it ran, and whether a
     // test read or wrote one of them.

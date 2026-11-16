@@ -1,9 +1,9 @@
 //! `FieldRef.Validate(Value)`.
 
 use crate::Session;
+use crate::blob_transfer::{BlobMove, Holder};
 use al_builtins::describe::Describe;
 use al_builtins::native::{AlError, Signal};
-use al_builtins::record_op::RecordOp;
 use al_builtins::value::{RecordState, RtType, Value};
 use al_data::TableDef;
 use std::cell::RefCell;
@@ -22,7 +22,14 @@ impl Session {
         args: &[Value],
     ) -> Result<Value, Signal> {
         let mut a = self.variant_validate_args(t, pos, args)?;
-        self.record_op(RecordOp::Validate, rec, &mut a)
+        crate::blob_transfer::validated_through_fieldref(&mut rec.borrow_mut());
+        // A Blob is validated as a copy (`blob_transfer::moved`).
+        if let Some(v @ Value::Blob(_)) = a.get_mut(1) {
+            let cur = rec.borrow().fields[pos].clone();
+            let kind = || self.blob_field_kind(t.object as usize, pos);
+            *v = crate::blob_transfer::moved(Some(&cur), v.clone(), BlobMove::FieldRefValidate, Holder::Other, kind)?;
+        }
+        self.validate_at(crate::records::ValidateSite::FieldRef, rec, &mut a)
     }
 
     /// `Record.Validate(Field, V)` with `V` written as a Variant (lowering picks `Record.ValidateVariant#1`): the value converts
@@ -49,7 +56,7 @@ impl Session {
             .clone()
             .ok_or_else(|| Signal::Unsupported("Record.Validate of a table without a schema".into()))?;
         let mut a = self.variant_validate_args(&t, pos, &args[1..])?;
-        self.record_op_from_al(RecordOp::Validate, rec, &mut a)
+        self.validate_at(crate::records::ValidateSite::AlRecordValidateVariant, rec, &mut a)
     }
 
     /// The arguments of a record Validate (field position first) for `FieldRef.Validate(args)` of the field at `pos`.

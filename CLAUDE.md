@@ -56,28 +56,21 @@ question, choose the better long-term solution over the quicker one.
    issue on the corpus repo. The only legitimate addition is a case shown to have passed
    by accident (for example against an unseeded store), with the owner's OK. Say so
    explicitly in the commit message.
-3. **No guessing at semantics.** Cite the corpus test (file:line) that pins a
-   behaviour in a code comment. If nothing pins it, write a probe test on a
-   branch of the corpus repo and read the result from its CI (ADR-007), get it
-   merged there, then bump the submodule and oracle and implement. Until then,
-   record a documentation-only assumption in `docs/probes-needed.md`, or
-   refuse. Error texts come from the corpus and are never invented.
-   Exception (owner, 2026-10-15): a behavior that Microsoft's own tests require
-   to pass on real BC (the test passes in Microsoft's CI and needs exactly this
-   behavior) may be implemented before a probe exists. Cite that test in the
-   code comment, add a `docs/probes-needed.md` row, and queue the probe. When
-   the probe lands it wins; fix the code if it disagrees. Error texts still come
-   only from the corpus. Every such code path marks its assumption when it runs,
-   and a test that passes through one is reported as a flagged pass ("passed,
-   relies on an unprobed assumption"), counted apart from clean passes. The
-   assumptions are registered in the runtime code itself (one registry, ids
-   checked by the compiler and a test), not only in a document.
-   Second exception (owner, 2026-11-10): a behavior an outside reporter's own repro shows (the
-   reporter's test passes on real BC and needs exactly this behavior) may be implemented before a
-   probe exists, under the same conditions: cite the repro or issue in the code comment, add the
-   `docs/probes-needed.md` row, queue the probe, mark the path through the assumption registry
-   (flagged pass), and the probe wins. Partner test suites do not qualify. Error texts still come
-   only from the corpus.
+3. **No guessing at semantics.** Every behavior cites the corpus test (file:line) that pins it, in a
+   code comment. When the pinned corpus does not cover a behavior yet (owner, 2026-11-12):
+   - Write a probe on a branch of the corpus repo and open its pull request (ADR-007).
+   - The runtime PR may land before that probe is merged or pinned. Until it is pinned, the path runs
+     only through an entry of the assumption registry (one registry in the runtime code, ids checked
+     by the compiler) that cites the open probe PR. A test that passes through it is a flagged pass,
+     counted apart from clean passes. Add the `docs/probes-needed.md` row in the same PR.
+   - Evidence for an assumption: the probe's result on a local BC, a Microsoft test that passes on
+     real BC, or an outside reporter's own repro (cite it; the probe is still written). Partner test
+     suites never count.
+   - The assumption covers only the shapes its evidence measures. Every other shape refuses.
+   - When a corpus bump pins the probe, delete the assumption and cite the pin. If the probe
+     disagrees, fix the code. The probe always wins.
+   - No probe written: refuse. Never run a behavior that has neither a pin nor an assumption id.
+   - Error texts come only from the corpus. Never invent one.
 4. **Unsupported is refused explicitly, never run silently.** Refuse
    statically wherever possible: a lowering reason, or a diagnostic in
    `al-sema`, so the runner reports the test as not run before it starts.
@@ -142,9 +135,9 @@ question, choose the better long-term solution over the quicker one.
   hour, and PR CI runs the full corpus on every major in about 6 to 12 minutes. Locally run
   `cargo test -p` and `cargo clippy -p ... -- -D warnings` for the crates you touched, and `cargo fmt --all`.
   Open the pull request as a draft and without auto-merge (owner, 2026-11-09): CI runs only the `test` job on a draft (owner, 2026-11-10),
-  so it takes little of the CI queue. The orchestrator reviews it. A single reviewed PR is marked ready
-  with auto-merge and lands on its own (owner, 2026-11-10); a merge train is used only when two or more
-  PRs are ready, and its pull request runs CI once for all of them. The orchestrator fixes or hands back
+  so it takes little of the CI queue. The orchestrator reviews it. Every reviewed PR lands through
+  a merge train, never on its own (owner, 2026-11-13): the train's pull request runs CI once for all of them. An outside
+  PR with one small thing left joins the train as it is, and the orchestrator fixes that thing in the train. The orchestrator fixes or hands back
   what that run reports. Agents never run `pkill`, `git stash`, `git commit -a` / `git add -A`, or start a
   workflow run; observation runs are local, and CI is only the PR's own run. `./check.sh` (fmt, clippy, all tests, the lists) stays for a person who
   wants the full check on their own machine.
@@ -199,6 +192,7 @@ question, choose the better long-term solution over the quicker one.
   PATTERN dir/` with a real folder (`crates/`, `docs/`): `grep -rn` on `.` in
   the main checkout also walks `.worktrees/` and `target/`.
 - Working method for implementation agents (gates, memory caps, report):
-  `docs/agents/brief.md`.
+  `docs/agents/brief.md`. Agent definitions: `.claude/agents/` (implementer, reviewer, probe writer);
+  the findings review keeps raising: `docs/agents/recurring-findings.md`.
 - A session on another machine that takes GitHub issues (setup and task loop):
   `docs/agents/remote-worker.md`.

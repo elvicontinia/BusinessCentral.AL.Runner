@@ -305,3 +305,972 @@ none of them yet (a later change raises them in the pinned order).
 - Probe to queue (Windows nightly, since the Linux tier does not render): RDLC layout to Word and Excel; Excel layout to Word
   and Html; Word layout to Excel again; `SaveAsWord`/`SaveAsExcel`/`SaveAsHtml(FileName)` then `File.Exists` and size;
   Run/RunModal/Execute of a Word and an Excel layout report with a logging subscriber. When it lands it wins.
+
+### Implementation notes (2026-11-12)
+
+- Code: `al-vm/src/report_placeholder/` (`grid.rs` the table above, `files.rs` the bytes, `run.rs` Run/RunModal/Execute) and the
+  content mark `al-builtins/src/placeholder_output.rs`. Tests: `al-vm/tests/reporting/report_placeholder_outputs.rs`.
+- Two cells the table marks "refused: not measured" are pinned by reports/CiReportRunLeads.al (BC 29.0 tier): an Excel layout
+  to Word (:267-270) and to Html (:662-666) answer false with `ReportUnsupportedFormat`, as Pdf does (:657-661). They are built
+  that way. RDLC to Word and Excel is pinned too: true, length > 0 (CiReportRunLeads.al:674-692 SaveAs_RdlcOnly_WordExcel, and
+  AMRdlcOutput.al:336-373 on Windows), so the table's "refused" cells for it are corrected: an RDLC layout writes the Word and
+  Excel placeholders.
+- `Report.Run`/`RunModal`/`Execute` of a report with an Excel default layout do not run on BC: they raise "The current report
+  operation is not supported for Excel Layout reports." (`ReportUnsupportedOperation`) before OnPreReport
+  (CiReportRunLeads.al:236-260). That pinned error is built (for a report without OnInitReport, request page or reportextension;
+  with one of them it stays refused). RDLC and Word layouts run without output as decided.
+- The content mark applies to every placeholder, and stays when AL code opens a new OutStream on the Blob (the stream writes
+  over the first bytes and the rest stays).
+- The PDF placeholder is marked too (owner decision 2026-11-12). A read answers only while it stays inside the bytes the
+  corpus pins at the start of BC's PDF, the signature `%PDF-` (`placeholder_output::PDF_PREFIX`): `ReadText(Text, 5)` of a
+  Windows stream gives '%PDF-' (AMReportOutputTests.al:42-45, AMRdlcOutput.al:177-180, onprem AMRdlcSaveAs.al:199-202), and
+  four Byte reads, each after EOS answered No, give 37,80,68,70 (streams/CjFix.al:128-147 for CjWordSections.al
+  SectionBreaks_WordMergeDataItem_Pdf). So `EOS` before byte 5, `Read` into a Byte (or a Char on a single-byte encoding) of
+  bytes 0-4, and `ReadText(Text, Length)` on a single-byte encoding that ends by byte 5 answer, and only while the buffer
+  starts with those bytes (not a copy taken part way, not bytes AL wrote over them). Everything else is refused: a read past
+  byte 5, a line read, a UTF-8 or UTF-16 text read (the tier may decode ahead), `InStream.Length`, the exact size (the size
+  answers only against 0, as for the other placeholders), page counts, Base64 and hashes. The version after the signature is
+  not BC's ('%PDF-1.3' in ReportEventsMoreCallForms.al:93, the placeholder's '1.4').
+- Five corpus cases had passed on the readable placeholder's made-up bytes and are listed as not passing (owner OK
+  2026-11-12): TestReportSaveAsPdfContent.al Report_SaveAs_Pdf_ReturnValueAgreesWithTheBytesInTheStream (Base64 of the whole
+  blob, the exact length), ReportExtensionSaveAs.al ControlReportWithoutExtension_Xml_Pdf and BaseWithOwnLayout_Xml_Pdf
+  (`Read(Head, 20)`, the exact length), and onprem AMRdlcSaveAs.al Static_SaveAsPdf (the page count) and
+  Static_SaveAsHtml_IsRefused.
+- The size of a marked placeholder (`Blob.Length`, `File.Len`, and through them System Application's `Temp Blob.Length()`) is the
+  value `Value::PlaceholderSize`: it answers a comparison with 0 (greater) and refuses everything else (a number, `Format`,
+  arithmetic, another comparison, a record field, and any builtin or .NET member given it: a record filter, `Get`, `Validate`,
+  a List or Dictionary element, key or index, `placeholder_output::size_guard`; only `Variant.Is*` asks its type). This is the correction the 2026-11-12 amendment (A4) names. It is a value and
+  not only the syntactic form `Blob.Length() > 0`, so that `Temp Blob.Length() > 0`, which returns the Blob's length through
+  two procedures, answers too (AMReportOutputTests.al:146, CiReportRunLeads.al:72).
+- A run that would print (SystemPrinter `true`, or a report that declares `UseSystemPrinter = true`) is refused, as "What stays
+  refused" says. An Excel layout run checks the layout event subscribers and the layout selections before it raises its pinned
+  error, as the RDLC and Word runs do.
+- The false answers raise SubstituteReport (static form, as the RDLC to Html answer) and not OnDocumentReady (AMReportOutputTests.al:221,
+  :257); a subscriber the test can see to another layout event refuses them.
+
+## Amendment 2026-11-12: opaque rendered content in Text values (Accepted, owner 2026-11-12)
+
+Status: Accepted by the owner on 2026-11-12, with these answers to the open questions: Part A as written; A7 (run Microsoft's layout
+selection code, a temporary selection of a Word layout no longer refused) yes; the one exact `Regex.Replace` entry yes; Part B is
+built only after the Windows probe is merged; `Contains` only (no `StrPos`/`IndexOf`); `Message` with a marked text stays refused.
+Part A is built (al-builtins `rendered_text.rs`; A7 in al-vm `report_placeholder/selection.rs`, for a user-defined Word layout selected
+by name without an app id); Part B waits for the probe.
+Part A is the opaque value. Part B ("known static text of the chosen layout") is part of the amendment by owner decision
+of 2026-11-12; Part A is written so that it works without Part B.
+
+### The problem
+
+The 2026-11-11 amendment writes a placeholder Html file and refuses every read of it into a Text (S1). An outside
+reporter counted his suite against that rule (al-runner issue 6924, comments of 2026-11-12 06:49, 07:03 and 07:08 UTC):
+
+- 229 tests save a Word layout e-mail body report as Html. None of them calls `SaveAs` itself. The path is Microsoft's:
+  `Report Selections`.`SaveReportAsHTML` -> `Report.SaveAs(.., ReportFormat::Html, OutStream)` into a Temp Blob ->
+  `Email Item`.`SetBody` (CopyStream) -> `Mail Management`.`SendViaEmailModule` -> `Email Item`.`GetBodyText()`
+  (`InStream.Read(Text)`) -> `Email Message`.`Create(.., Body, true, ..)`.
+- A subscriber of the reporter then runs `BodyText.AddText(Message.GetBody())`, appends an Html signature and calls
+  `Message.Create(.., Format(BodyText), true)`. Tests with the dialog read `EmailEditor.BodyField.Value()` in a ModalPageHandler.
+- 184 tests assert nothing about the body. 4 assert `AreNotEqual('', Body)`. 41 assert `Body.Contains(<language marker>)`;
+  the marker is static text of the Word layout.
+
+Under S1 all 229 stop at `GetBodyText()`. The goal: the 184 and the 4 run, the 41 are reported as not run. No test may
+fail or pass because of text the runtime made up.
+
+### Decision in short
+
+1. A Text can hold **rendered content**: text that BC produced with a renderer and whose characters this runtime does not
+   know. It is known to be not empty. Nothing else is known about it.
+2. Rendered content is marked inside the text with one reserved character, `RENDERED_TEXT_MARK` (U+FDD4), the fourth
+   mark of the existing kind (`CALL_STACK_MARK`, `CARRIED_TEXT_MARK`, `SQL_COUNT_TEXT_MARK`; `Txt::has_marker`). No new
+   `Value` variant and no new field on `Value` or `Txt`.
+3. A marked text may be moved: assigned, passed, returned, stored in an unbounded Text, a Variant, a List or Dictionary
+   value, a TextBuilder or BigText, joined with known text, written to a UTF-8 stream and read back whole. Each of these
+   gives a marked value again.
+4. A marked text may be asked one question: is it equal to `''`. The answer is no.
+5. Every other use refuses with `Signal::Unsupported`. The rule is an allow-list: a use that is not listed in the table of A3
+   refuses. A new allowed use is added only as an exact match of a pinned or reported shape.
+6. The mark starts at exactly one place: a whole text read of a Html placeholder buffer (section A2).
+7. Part B: `Contains(X)` answers true when `X` is fixed text of the Word layout the save used, under a narrow rule. It
+   never answers false.
+
+This changes no seam. `Txt`, `Value`, `Ctx` and the builtin catalog keep their shapes; the change adds a mark, a guard at
+the builtin call and rows in one table.
+
+## Part A: the opaque value
+
+### A1. Where the mark lives, and why there
+
+**Decision: in the text itself, as U+FDD4, owned by a new module `al-builtins/src/rendered_text.rs`.** The module owns the
+mark, the refusal text, the allow-list of section A3 and the helpers the other owners call. The blob side stays with
+`al-builtins/src/placeholder_output.rs` (2026-11-11 amendment).
+
+Reasons:
+
+- The mechanism exists and has one owner per rule. `native::text_of` already refuses a marked text for every builtin that
+  takes a Text argument through it. `ops::compare` already answers a marked text against `''` and refuses the rest.
+  `Txt::push_txt` and `+` keep the characters. One fix is needed first: `Txt::push_str` (`text.rs`) updates the cached
+  marker answer only for `CALL_STACK_MARK`; it must do so for every mark. The stream code already writes and reads a mark
+  (`CALL_STACK_MARK_BYTES`), the row store already refuses a marked key, the filter code already refuses a marked filter value.
+- The mark survives paths that a side flag would lose without notice: a `String` round trip inside a native, a `format!`,
+  the wire to the .NET sidecar, a stored row.
+- Cost for ordinary text: none on the value. `Txt::has_marker` scans a text once and caches the answer; the scan looks for
+  four characters where it looks for three today. The append test that counts scans (`marker_scans`) stays as it is.
+
+Alternatives considered and not chosen:
+
+| Alternative | Why not |
+|---|---|
+| A new `Value::RenderedText` variant | Every `match` on `Value::Text` would need a decision, about 1,000 places. A place that forgets the variant fails closed, which is good, but joined text ("signature + body") needs a second representation for the known parts, and TextBuilder, BigText, List and JSON hold `Txt`, not `Value`. |
+| A flag on `Txt` beside the string | Lost by every `into_string`, `to_string` and `format!`. Each loss is a silent wrong result. |
+| Keep the placeholder Html as real text and flag the test | The test would see made-up characters: `Contains('NLB')` answers false and the test fails wrongly. |
+
+Shape of a marked text: known characters and marks in the order BC has them. `Signature + Body` is the signature's
+characters followed by the mark. The mark is followed by one character that numbers the render (read only directly after
+the mark). The number is unique in the process, never per session: a SingleInstance global or a stored row can carry a
+marked text from one test session into the next, and a number that started again at 0 would then name another render.
+The number points to an entry of a process-wide list: the report, the format and the layout. An entry is never reused.
+
+The mark has two forms (review finding 3):
+
+- **whole** (U+F0000 + n): the complete rendered content of render n stands at this place, unchanged.
+- **changed** (U+100000 + n): content derived from render n by an allowed step that can change characters (only P12 today).
+
+Part A treats both forms alike. Part B answers only for the whole form. Every row of A3 must say which form its result
+has; a row that does not embed the whole content unchanged gives the changed form or is not allowed. Marks from two
+renders can stand in one text.
+
+### A2. Where a marked text starts
+
+Only here:
+
+| Source | Result |
+|---|---|
+| `InStream.Read(Text)` without a length, at position 0 of a buffer that holds the **Html** placeholder (mark of `placeholder_output`, format Html) | A text that is the mark alone. The placeholder's own markup never reaches AL. |
+| `BigText.Read(InStream)` on such a buffer | The BigText holds the mark alone. |
+| The same two reads on a buffer that a marked text was written to (A4) | The text that was written, marks included. |
+
+Every other read of such a buffer stays refused as S1 says: `Read` with a length, `Read` when its return value is used
+(the number of characters is not known), `ReadText` (it reads one line, and the line breaks of the rendering are not known),
+`EOS`, `Position`, `Length`, a read that starts after position 0. Word, Excel and Pdf placeholders never give a marked
+text: they are binary, and a text read of them stays refused.
+
+Why "not empty" is safe to assume: BC's Html of a Word layout has output and starts with markup
+(reports/layouts-saveas/AMReportOutputTests.al:205-217, `has_output` Yes, `kind` markup). The Html placeholder is written
+only for a Word layout.
+
+That case is a report with data that runs to its end. Nothing pins the output of a report that ends with
+`CurrReport.Quit` or whose data items read no row. So a read of A2 refuses when the report run that wrote the placeholder
+ended by `CurrReport.Quit` or produced no dataset row, until probe group P (B5) measures both.
+
+Measured since (corpus pull request 1362, `reports/layouts-html-text/HtRenderedTextTests.al`, BC 27.5 and 28.5): a run with no
+dataset row writes no Html and `SaveAs` answers false without an error (:320-335); `CurrReport.Quit` in OnPreReport or
+OnAfterGetRecord gives the same (:364-393), in OnPostReport the output is written and the answer is true (:396-409). The
+runtime answers the first for one data item saved to a stream with the answer used; a Quit before OnPostReport refuses,
+and a Quit in OnPostReport writes the placeholder as before.
+
+Measured 2026-11-13 (corpus pull request 1371, `reports/html-email-body/RxLayoutSelectionTests.al`, the same on the three BC
+majors the corpus runs), and what the runtime does with it (`report_placeholder/no_row.rs`, `report_placeholder/stored.rs`):
+
+- No dataset row. A Word layout `DefaultRenderingLayout` names: Pdf, Word and Html answer false with `ReportResultEmpty`, the
+  statement form raises it, OnPreReport and OnPreRendering ran and OnPostReport did not (:852, :873, :915). A `DefaultLayout =
+  Word` report without report triggers: the same for Html and Pdf (:979, :1001). An RDLC layout report without report
+  triggers: Pdf and Word answer true and write nothing (:937, :958). The runtime answers these cells for one data item, no
+  report extension and a stream (`report-save-no-dataset-row`); a Word layout report that declares OnPostReport refuses (the
+  runtime has run it by then), every other Word layout shape with no row refuses, and an RDLC report outside the cell writes
+  its placeholder as before.
+- A stored Report Layout Selection row of the company. Type RDLC (built-in): Html answers false with
+  `ReportUnsupportedFormat` and no trigger, Pdf, Word and Excel render (:452, :477, :1082, :1116). Type Custom Layout with a
+  code that names no layout: every format answers false with `ReportNoLayout` (:746, :771). A row of another company or with
+  an empty Company Name is not read (:795, :1022). The runtime answers the first two for a stream with the answer used, of a
+  report whose default Word layout `DefaultRenderingLayout` names (`report-stored-layout-selection`); the third it did
+  already. Measured and not built yet: a Tenant Report Layout Selection row (it wins over the type, :501-:648) and Custom
+  Layout with the code of a Tenant Report Layout row (:697); they keep the refusal.
+
+### A3. What is allowed
+
+Every row gives a marked result or moves the value unchanged, unless the row says otherwise. "BC" says why the result is
+right on BC whatever the rendering holds.
+
+| # | Use | Result | BC |
+|---|---|---|---|
+| P1 | Assignment to a `Text` without a length, a `Variant`, a `var` or by-value parameter, a return value, an event argument | the same text | A copy of a text is the text. |
+| P2 | `A + B`, `+=`, `TextBuilder.Append`, `AppendLine`, `BigText.AddText` (at the end) | the parts in order, marks kept | Joining does not look at the characters. |
+| P3 | `TextBuilder.ToText()`, `Format(TextBuilder)`, `Format(Text)` and `Format(Variant holding it)` with no length and no format number, `BigText.GetSubText(T, 1)` without a length and with its return value unused (the return value is a length) | the same text | Each is the identity on a Text (the corpus pins this for known text; the citing line goes into the code comment). |
+| P4 | `StrSubstNo(Known, .., T, ..)` with the marked text as a value, never as the template, and only where the template uses that value as `%n`. A `#n` field pads or cuts to a width and shows `*` on overflow, which depends on the length: refused. | the filled template with the mark | The value is put in through `Format` (format-evaluate/P86StrSubstNo.al Sub_Percent), as for a SQL counter text (al-runner issue 7129). |
+| P5 | `T = ''`, `T <> ''`, and `''` on the left | false, true | Rendered content is not empty (A2); known text joined to it cannot make it empty. Already the rule for a call stack text (`ops::compare`). |
+| P6 | `T = Known` or `T <> Known` (these two operators only) where the known characters before the first mark of `T` already differ from `Known` | the exact answer, always "not equal" | The known characters are BC's, and text equality on BC is ordinal and case-sensitive (the `Operators_TextComparison_IsCultureOrderAndCaseSensitiveEquality` case). Existing rule (`ops::known_prefix_order`), used for equality only. |
+| P7 | `OutStream.Write(T)`, `WriteText(T)`, `BigText.Write(OutStream)` on a UTF-8 stream, with the return value unused (it is a count that depends on the length) | bytes of the known parts and the mark; the buffer is marked (A4) | Writing does not look at the characters. |
+| P8 | `List.Add`/`Set`/`Insert`/`Get`, `Dictionary.Add`/`Set`/`Get` with the text as a **value** | stored and returned unchanged | As for a SQL counter value (`sqlcount::guard`). |
+| P9 | `Variant.IsText`, `IsCode` and the other `Is*` | the pinned answer for a Text | The type is known. |
+| P10 | `Session.LogMessage` with the text as message or dimension value | nothing AL can read | Telemetry is not readable by the test (SqlCounters.al:516 P6924_Counters_FormattedInTelemetryDimension_NoError). |
+| P11 | A page field whose source is a Text variable or an unbounded expression, read by `TestField.Value()` when the control shows a Text unchanged (no `OptionCaption`, no format property, not `ExtendedDatatype = RichContent` until measured) | the same text | The control shows the text as it is. |
+| P12 | `DotNet` `Regex.Replace(T, Pattern, Replacement)`, static, only with the exact pattern and replacement of `Email Message Impl.`.`ReplaceRgbaColorsWithRgb` (System Application) | the sidecar's result on the known parts; every mark in the result gets the **changed** form | `Email Message`.`Create` calls it on every body. The replacement text is never empty, so a not-empty text stays not empty. See A5. Narrowed 2026-11-13 to what corpus pull request 1371 measured (`RxEmailBodyTests.al`, `RxTenantLayoutBodyTests.al`): only a body that holds one render, saved with no stored selection row of the report and with no `rgba(` in its dataset, in one of five forms (`rendered_text::RGBA_REPLACE_MEASURED`): the Html of the Word layout `DefaultRenderingLayout` names, of a report with one data item and no report extension, with no temporary selection; or that with exactly one fact changed: `DefaultLayout = Word` (:319), a data item inside the data item (:346), one report extension that only adds columns (:373), the user-defined Word layout a temporary selection named (A7; :121, :154, :225). Each other shape refuses with its own reason until a probe measures it: two of the changed facts together, other data item trees or extensions, a stored selection row of the report, a body that joins two renders. A layout whose static text holds `rgba(r,g,b,1)` is changed by `Create` (corpus pull request 1362, `HtStaticTextTests.al`:522); the changed form covers it. |
+
+`Email Message`.`Create`, `GetBody`, `Email Item`.`SetBody`, `GetBodyText` and the editor page are AL compiled from
+Microsoft's source. They need no rule of their own: they use P1, P2, P5, P7, P12, A2 and the Blob rules of A4.
+
+Two gaps against the goal. The owner decided both on 2026-11-12:
+
+- `Format(BigText)` (no format string) is added to P3 by owner decision: on a BigText that holds a mark it returns the
+  text with the mark in the **changed** form (A1), so Part A passes it on and Part B no longer answers for it. The reporter's
+  subscriber uses `BodyText.AddText(..)` and `Format(BodyText)`. Probe cell queued: `Format` of a BigText that holds a long
+  text (does BC return it whole?); when it lands it wins.
+- BC 27 to 29 compile `DoSaveReportAsHTMLInTempBlob` with its `#if not CLEAN27` block: after the save it runs
+  `FileManagement.BLOBExportToServerFile`, raises `OnReplaceHTMLText` with the file path and runs
+  `BLOBImportFromServerFile`. These are byte copies to and from a file. They run only as far as the file rules of the
+  2026-11-11 amendment allow (F4, F8 as byte copies with the mark); any step those rules do not cover refuses.
+
+### A3b. What refuses
+
+Everything that is not in the table above. The reason is
+`a use of the rendered content of report <name> (<format>, layout <layout>): <what>; the runtime has no layout renderer, so
+the text is not known`. The most likely uses, so that nobody adds them by mistake:
+
+| Use | Why it cannot be answered |
+|---|---|
+| `=`, `<>` against a text that is not `''` (outside P6), `case`, `in` | depends on the characters |
+| `<`, `>`, `<=`, `>=`, a range in `in [a..z]` or in a `case` label, always, also against `''` and also when the known characters before the mark differ | BC orders text by culture, not by code point (`Operators_TextComparison_IsCultureOrderAndCaseSensitiveEquality`): `('Body ' + Html) < 'body'` is false on BC and an ordinal compare says true. See A5 for the code path that answers this wrongly today. |
+| `Contains`, `StrPos`, `IndexOf`, `LastIndexOf`, `StartsWith`, `EndsWith`, `IndexOfAny` | depends on the characters. Also on a known part: kept refused in Part A, one rule for all |
+| `StrLen`, `Text.Length`, `MaxStrLen` of the value's content, `TextBuilder.Length`, `BigText.Length` | the length is not known |
+| `CopyStr`, `Substring`, `DelStr`, `Remove`, `PadStr`, `InsStr`, `Insert`, `T[i]` read or write, `foreach` over the text, `Split`, `SelectStr` | a part of unknown text, and a part can lose the mark |
+| `UpperCase`, `LowerCase`, `ToUpper`, `ToLower`, `Trim*`, `DelChr`, `ConvertStr`, `Replace`, `IncStr` | Could be allowed as "unknown stays unknown", but `Trim`, `DelChr` and `Replace` can give `''`, which breaks P5. All refused until a reported test needs one; then it is added as its own row with its own proof that the result is not empty. |
+| Assignment or parameter passing into `Text[N]`, `Code[N]`, a Text or Code **field** of a record, a Label | BC raises when the text is longer than N. The length is not known, so neither "raises" nor "fits" is known. `Code` also changes case. |
+| `Evaluate`, an implicit conversion to a number, date, Guid, Boolean, Option | parses the characters |
+| Hashes (`Cryptography Management`, `GenerateHash`), `Base64 Convert`, `Compress`, encryption, `SecretText` wrapping | computes from the characters |
+| A Dictionary **key**, a List searched by value (`Contains`, `IndexOf`, `Remove(Value)`), a sort | compares the characters |
+| `SetRange`, `SetFilter`, `Get`, `Validate` with the value; a `TestField.SetValue`, `TestFilter.SetFilter` | compares or stores into bounded fields |
+| `Error`, `Message`, `Confirm`, `StrMenu`, `Notification`, `ErrorInfo` texts, `Dialog.Update`, `CurrPage.Caption` | the text reaches the test (`GetLastErrorText`, a handler's argument) or the user. Refused in step 1; a handler that only receives the text could be opened later as its own row. |
+| `JsonObject.Add`, `JsonValue.SetValue`, `JsonObject.ReadFrom(T)`, `XmlText.Create`, `XmlDocument.ReadFrom(T)`, `XmlElement.InnerText` | Writing would be safe only if every later read of the document were guarded; reading parses. Refused in step 1. |
+| `HttpContent.WriteFrom(T)`, `HttpClient` bodies and headers | the mocked or real receiver sees bytes the runtime made up |
+| `File.Write`, `WriteText` to a file opened in text mode, `Download*`, `Hyperlink` | the bytes leave the session, or AL reads them back in pieces |
+| A stream write in an encoding other than UTF-8 | The known parts would be encoded with loss, and no mark form is defined there. Refused in step 1. |
+| Any `DotNet` call with a marked argument, outside P12 | the sidecar would compute on the mark as if it were text |
+| `InStream.ReadText`, `Read` with a length, `EOS`, a second read | see A2 |
+
+### A4. Blobs, Temp Blob and stored rows
+
+- A buffer that a marked text is written to gets the placeholder mark of the 2026-11-11 amendment with a new kind "text
+  with rendered content". All its rules apply unchanged: `HasValue` true, `Length` > 0 only as a sign, `CreateInStream`
+  allowed, `CopyStream` copies bytes and mark, a record assignment and a stored Blob keep the mark with the row (S4), hashes,
+  Base64, Xml and zip readers refuse.
+- `Email Message`.`Body` is a Blob field. `Modify` stores bytes and mark; `CalcFields` returns both. The mark of a stored
+  Blob is already stored with the row (S4 of section 4).
+- A whole text read gives the written text back (A2). The known parts follow the pinned stream rules for known text
+  (terminator and encoding: streams/ProbeJsonAndInStreamBytes.al); the mark's bytes are its UTF-8 form plus the render number.
+- The byte length is never answered as a number (review finding 2). `Blob.Length`, `TempBlob.Length`, `File.Len` and
+  `FileManagement.GetFileSize` of a buffer or file with a placeholder mark answer only in the sign-only form the runtime
+  already has for a call stack text (`stream::blob_length_sign`: the call compared directly with 0 by `> 0`, `<> 0` or
+  `= 0`). Every other use of the length refuses. `TempBlob.Length() > 1000` is true on BC and would be false on a
+  93-byte placeholder.
+- This holds for the buffers of this amendment and it is a correction to the 2026-11-11 build for all placeholder kinds:
+  on branch `adr040-outputs`, `blob_length_of` and `File.Len` return the placeholder's byte count today. That is fixed
+  there before this amendment is built on it.
+
+### A5. How the allow-list is enforced
+
+One rule, one owner each. A marked text meets the runtime at five kinds of places:
+
+| Place | Owner | Default |
+|---|---|---|
+| A builtin call (function, method, operator builtin) | New guard `rendered_text::guard(id, receiver, args)`, called where `sqlcount::guard` is called (`al-vm/src/exec/run.rs`, both call sites). It runs while a process-wide flag is set. The first read of A2 sets the flag and nothing clears it for the rest of the process, because a marked text can outlive the session that read it (a SingleInstance global, a stored row, the strict order mode). It looks at the receiver and each argument, into a Variant, a TextBuilder and a BigText. A marked value at a position that table A3 does not list for this builtin id refuses. | refuse |
+| A native that reads a Text argument | `native::text_of` (exists): `None` for a marked text, so the native refuses. Natives of table A3 take the text through one named helper, `rendered_text::carried`. | refuse |
+| Comparison | `ops::compare` for `=` and `<>`: P5 and P6 answer, the rest refuses with the rendered refusal text. `ops::compare_order` for `<`, `>`, `<=`, `>=` and ranges: refuses a marked operand before anything else. Today it does not: `text_of` gives `None` for a marked text and `compare_order` then falls to `compare` and `known_prefix_order`, an ordinal answer where BC uses culture order. The same wrong answer exists today for `CALL_STACK_MARK`. Fixing `compare_order` for every mark is a separate fix with its own test and comes before this amendment is built. | refuse |
+| Conversion to a declared type | `ops::convert`: a marked text converts only to an unbounded Text and to a Variant. Today a marked text passes into any `Text[N]` unchecked (`ops.rs:68`, `:240`); for U+FDD4 that arm refuses. | refuse |
+| The .NET sidecar | The marshalling of a `DotNet` call's arguments: a marked text refuses unless (type, member, the known arguments) is an entry of `rendered_text::DOTNET_ALLOWED`. One entry: P12. | refuse |
+
+Cost: a run that never reads a Html placeholder into a Text pays one Boolean test per builtin call, the same shape as
+`self.sql.active`. After the first such read every builtin call of the process looks at its arguments. No cost on text
+operations.
+
+### A6. What happens at the edges
+
+- **An assert in the test.** `Library Assert` is AL. `AreNotEqual('', Body)` runs P1, P3 and P5 and passes, as on BC.
+  `AreEqual`, `IsTrue(Body.Contains(..))`, `ExpectedMessage` on the body reach a refused comparison or text function, so the
+  test is reported as not run. An assert that fails on another value and puts the body into its message reaches `Error`
+  with a marked text: refused, not a failure.
+- **An output parameter or return value back in the test.** Allowed (P1). The test can hold it, pass it on and ask P5.
+- **Error or Message text.** Refused (table). A test never fails with a made-up text in its message.
+- **JSON, XML, HttpContent, a file.** Refused in step 1 (table). Each can be opened later with its own guard and proof.
+- **The runner's own output.** A refusal reason, a failure text, `--explain`, the debugger's variables and the profiler
+  print a marked text through `Describe`, which prints `<rendered content of report X>` for the mark, never the mark
+  character and never placeholder markup.
+- **State that outlives the test.** A SingleInstance global or a stored Blob keeps the mark, because the mark is in the
+  text and in the row.
+
+### A7. Needed first: the layout that `SaveReportAsHTML` selects
+
+Without this, none of the 229 tests reaches the placeholder. `Report Selections`.`SaveReportAsHTMLImpl` always calls
+`Report Layout Selection`.`SetTempLayoutSelectedName(LayoutName, AppID)` (or `SetTempLayoutSelected(Code)`) before the
+save. That fills the SingleInstance codeunit "Design-time Report Selection". The 2026-11-08 amendment refuses a save while
+that codeunit holds a selection. The reporter's layout is a user-defined Word layout (a `Tenant Report Layout` row
+imported from a .docx), named by a GUID.
+
+Decision: a save is not refused for a selection alone. The runtime resolves the selected layout and uses its **type** in
+the format x layout grid of the 2026-11-11 amendment:
+
+- The selection is read by raising the platform's layout selection event `SelectReportLayoutCode` to Base Application's
+  `ReportManagement` subscriber only, so Microsoft's selection code runs as AL (hard rule 7). BC raises no
+  `SelectedBuiltinLayoutType` once that event answered a selected layout (corpus pull request 1362,
+  `HtRenderedTextTests.al`:494, :530). Subscribers of other apps keep the "a subscriber the test can see" refusal.
+- The answer (layout name and app id, or a custom layout code) must name a layout the runtime can find: a rendering layout
+  the report or a reportextension declares, or a `Tenant Report Layout` row for the report. Its type decides the grid
+  column. Word gives the Html placeholder.
+- Refused: a name that matches nothing, a `Custom Report Layout` code (table 9650, the old custom layouts), a type that
+  cannot be told, an answer that changes between the two events.
+
+This is not pinned. No corpus case saves with a temporary layout selection, and the events' order inside `SaveAs` is pinned
+only for the default layout (AMReportOutputTests.al:210). It is built under the second exception of hard rule 3 (the
+reporter's tests pass on BC and need the save to succeed with the selected Word layout), with its own assumption id and probe.
+That exception is its only basis. Probe cells S5 (a name that matches nothing) and S6 (the events and their order inside
+`SaveAs`) of B5 are required cells of the probe: until they are in the oracle, the unmatched name stays refused and the
+two events are raised only to `ReportManagement`, in the one order the default-layout case pins.
+
+### A8. Ways the mark could be lost, and what prevents each
+
+A lost mark is a silent wrong result: AL would read made-up or missing characters as real text.
+
+| # | How it could be lost | What prevents it |
+|---|---|---|
+| L1 | A native reads a Text argument with `as_str()` and never asks `has_marker` | The guard of A5 runs before the native and does not depend on how the native reads. A test walks the whole builtin catalog: every builtin with a Text, Code, Variant, Joker, TextBuilder or BigText receiver or parameter is called with a marked value and must refuse, unless its id and position are a row of A3. A new builtin without a row refuses and the test names it. |
+| L2 | A text part without the mark (`CopyStr`, `T[i]`, `Split`) | All refused (table). The catalog test covers them. The VM's index and `foreach` paths (`interp.rs:516`, `:1306`) already test `has_marker`; a unit test per path. |
+| L3 | Truncation into `Text[N]` or a field | Conversion refuses (A5). Test: assign to `Text[10]`, a record field, a `Code[20]` parameter. |
+| L4 | A stream write in an encoding that drops the mark, then a read | Non-UTF-8 writes refuse. Test per `TextEncoding`. |
+| L5 | A byte path: a marked buffer read as bytes, hashed, sized exactly | The buffer carries the placeholder mark; the 2026-11-11 tests (`report_no_output_*`, S1 to S7) run for the new kind too. |
+| L6 | The sidecar returns a text or number computed from the mark | `DOTNET_ALLOWED` is the only way in. Test: every DotNet call in the test fixture with a marked argument refuses; P12 keeps the mark. A sidecar result for P12 that has lost a mark refuses (the count of marks in and out must match). |
+| L7 | A second source: someone marks another reader as "whole read" | A2 is one function (`rendered_text::read_whole`). Test: every stream and blob reader of the catalog on a Html placeholder buffer refuses except the two of A2. |
+| L8 | The placeholder markup itself reaches AL | A2 gives the mark alone. Test: after a read, the text holds no character of the placeholder file. |
+| L9 | AL code or data holds U+FDD4 by itself | It refuses where it would have run. That is a wrong refusal, not a wrong result. Same as the three existing marks. |
+| L10 | A container compares or prints its elements (List.Contains, Dictionary key, `Format(List)`) | Element comparison goes through `ops::compare`; keys refuse in the guard. Catalog test rows for containers that hold a marked value. |
+| L11 | The runner prints the mark or the placeholder in a report | `Describe` test for the mark; a test that a JUnit file and `--explain` of a refused test hold neither U+FDD4 nor the placeholder markup. |
+| L13 | An ordered comparison answers by code point | `compare_order` refuses a marked operand (A5). Test: `<`, `>`, `<=`, `>=`, `in` range and `case` range, with the mark at the start and after a differing known prefix, for each of the four marks. |
+| L14 | A length leaves as a number (Blob, Temp Blob, file, return value of `Write`, `WriteText`, `GetSubText`, `Read`) | Sign-only length (A4); the rows P3 and P7 require an unused return value. Test per call, with the value used and unused. |
+| L15 | A marked text from an earlier session is read with another session's render list, or with the guard off | Process-wide render numbers and flag (A1, A5). Test: strict order, a SingleInstance codeunit keeps the body of render A, the next test codeunit renders B and asks about the kept body. |
+| L16 | An allowed step changes the content and Part B still answers from the layout | The whole and changed forms (A1). Test: after P12 `Contains` refuses; a `#n` field refuses. The catalog test fails when a row of A3 does not declare its form. |
+| L12 | A later change adds an allowed use by widening a rule | Table A3 is data in one file with one row per builtin id and position, each with its citation. A test fails when a row has no citation or when the table and this ADR section differ in count. |
+
+Added after review rounds 1 and 2 (2026-11-12): the guard of A5 covers builtin calls only. These paths are not builtin calls and
+each has its own owner and test (`al-vm/tests/reporting/rendered_text_leaks.rs`):
+
+| # | Loss | What prevents it |
+|---|---|---|
+| L17 | `T[i] := c` writes over the mark or a character of unknown position | `interp.rs` `write_char` refuses rendered content at every position. For the three other marks it keeps a position inside the known characters before the first mark and refuses the rest. |
+| L18 | A `Text[N]` variable takes the text through the write-back of a `var` argument (`InStream.Read`, `Dictionary.Get`, `List.Get`, `BigText.GetSubText`, a procedure's `var Text` parameter) or as a `foreach` variable | `interp.rs` `rendered_into_place`: the conversion of an assignment (A5). |
+| L19 | A write that is no append changes a buffer a marked text was written to, or a marked text is written over bytes that were there | `stream::write_bytes` and `rendered_text::mark_written`: the buffer gets the kind "text with rendered content that was written over", and no read answers for it. BC's rendering is longer than its mark, so which bytes BC keeps is not known. |
+| L20 | A report dataset column or an XmlPort text variable writes the mark as bytes into a buffer without a mark | `dataset::escape` and `xp_pass_variable` refuse. |
+| L21 | A page control's text reaches `AssertEquals`, an `As*` method, a lookup or a request page's parameters | `control_text` refuses; only `TestField.Value()` reads it (P11). |
+| L22 | A CaptionClass expression (a page control's, a table field's) gives rendered content, and the area before its first comma is read from the mark | `Session::refuse_rendered_caption_class` (al-vm `pages/caption_class.rs`) refuses where the expression's value becomes a class text. Table A3 has no CaptionClass row. |
+| L23 | An array carries the text past the guard, or `CopyArray` puts it into a `Text[N]` or `Code[N]` element without the conversion of an assignment | The guard of A5 looks into arrays. `CopyArray` (P1), `CompressArray` (P5), `ArrayLen` (P9) and `Clear` (P1) are rows; the write-back of an array (the `CopyArray` destination, a `var` array parameter) converts each marked element to the element type (`rendered_into_place`). |
+
+`BigText.GetSubText` of P3 is the Text target overload with the Integer position 1 only; the BigText target is not in table A3
+and refuses.
+
+### A9. Assumptions and flagged passes
+
+- `report-html-rendered-text`: marked when a read of A2 gives a marked text. Text: the Html of a Word layout is not empty,
+  and a body that only moves through Text values and UTF-8 streams never changes what the test can see. Source: the
+  reporter's tests (al-runner issue 6924). A test through it is a flagged pass.
+- `email-body-rgba-replace-keeps-content`: marked when P12 runs. Text: `Regex.Replace` with that pattern and replacement
+  maps the Html of one render in a measured form (P12), with no `rgba(` in its dataset, to a not-empty text.
+- `report-layout-temp-selection`: marked on every save A7 resolves (the selected layout is a Tenant Report Layout row, never the
+  report's default).
+- `report-save-no-dataset-row`: marked when a save whose run wrote no dataset row takes a measured answer (corpus pull
+  request 1371, `RxLayoutSelectionTests.al`:852-1001; corpus pull request 1362, `HtRenderedTextTests.al`:320-335).
+- `report-stored-layout-selection`: marked when a save answers by a stored Report Layout Selection row (corpus pull request
+  1371, `RxLayoutSelectionTests.al`:452, :477, :746, :771).
+- Each gets a row in `docs/probes-needed.md` and a file under `al-builtins/src/assumptions/`.
+- Probes to queue on the corpus (Windows tier, it renders): (1) a Word layout report saved as Html to a Temp Blob,
+  `InStream.Read(Text)`, then `T <> ''`, `Format(T) = T`, `TB.Append(T); TB.ToText() = T`, a UTF-8 stream round trip
+  `= T`, a Blob field stored and read back `= T`. (2) `Email Message`.`Create(.., T, true)` then `GetBody() <> ''`.
+  (3) A user-defined Word layout selected with `SetTempLayoutSelectedName`, saved as Html: answer, events and their order.
+  (4) `TestField.Value()` of a `MultiLine` control and of a `RichContent` control over a long Text variable.
+  When a probe lands it wins.
+
+### A10. Evidence
+
+| Claim | Pinned by | State |
+|---|---|---|
+| Html of a Word layout has output and is markup | reports/layouts-saveas/AMReportOutputTests.al:205-217 | pinned |
+| That same case reads 5 characters and runs `Contains` on the Html (`has_request_value`, `has_constant_column` both No) | AMReportOutputTests.al:43, :165-166, :215-216 | pinned on BC; stays not passing here (reads content) |
+| Html of an RDLC layout is refused by BC | text/TestReportSaveAsDatasetContracts.al `SaveAs_Html_WithAnRdlcLayout_IsRefused` | pinned, built |
+| A marked text is not `''`, and round-trips through a stream | errors/last-error/WdCallStackToBlob.al:96-102 (call stack mark) | pinned for the mechanism, not for Html |
+| A marked text may go to telemetry unread | session-system/session/SqlCounters.al:516 | pinned for the mechanism |
+| `Read(Text)` without a length reads to the terminator or the end | streams/ProbeJsonAndInStreamBytes.al `InStreamRead_Text_*` | pinned for known text |
+| `StrSubstNo` fills a value through `Format` | format-evaluate/P86StrSubstNo.al | pinned for known text |
+| The e-mail path (`Email Item`, `Email Message`, the editor page) with a rendered body | no corpus case | **not measured**; reporter's 188 tests pass on BC |
+| A save with a temporary layout selection | no corpus case | **not measured** (A7) |
+| `TestField.Value()` of the editor's body controls | no corpus case; `RichContent` appears only in must-not-compile | **not measured** |
+| `Regex.Replace` keeps a not-empty text not empty | corpus pull request 1371 (open), `RxEmailBodyTests.al`:86, :110, :158: the Html of a default Word layout holds no `rgba(`, and `GetBody` gives the body back; BC 27.5, 28.5, 29.0 | measured for the Word layout `DefaultRenderingLayout` names, one data item, no report extension, and with one fact changed: `DefaultLayout = Word`, a data item inside the data item, a report extension that adds a column, a user-defined layout a temporary selection named (`RxTenantLayoutBodyTests.al`:319, :346, :373, :121, :154, :225); **not measured** for two of them together, other data item trees or extensions, two renders in one body. Layout text that holds `rgba(r,g,b,1)` is changed (corpus pull request 1362, `HtStaticTextTests.al`:522) |
+| Which of the 188 tests meet a refused use after the body is read | the reporter's `--explain` after the build | **not known** |
+
+### A11. What it unlocks, and what stays
+
+- Reporter's suite: up to 188 of 229 (184 + 4) with Part A. With Part A alone the 41 `Contains` tests are reported as not
+  run; with Part B those whose marker is a certain static text of the layout the save used can run. "Up to": a test that meets
+  a refused use on the way (for example a connector that reads the body into JSON) stays not run, and `--explain` names
+  the use.
+- Microsoft's tests: not counted. A count of tests that stop at "read of the content of a placeholder Html" after the
+  2026-11-11 build gives the number.
+- Corpus: no case moves. AMReportOutputTests.al `WordLayout_SaveAsHtml` reads characters and stays listed.
+
+### A12. Conformance
+
+- `al-vm` tests `rendered_text_*`: one per row of A3 (allowed: the result holds the mark and the known parts in order),
+  one per row of the refusal table, one per line L1 to L12.
+- The catalog test of L1 in `al-builtins`, and the table and ADR count test of L12.
+- The assumption registry test for the three ids; `--assumptions-doc` regenerated.
+- A reduced AL fixture of the reporter's path (Temp Blob, `Email Item`, `Email Message`, signature, editor handler) run
+  against Microsoft's apps: passes flagged, and its `Contains` twin is not run.
+- `--baseline-diff` on BC 27, 28 and 29: no regression, no new failure.
+
+## Part B: known static text of the chosen layout
+
+Owner decision 2026-11-12: this part belongs to the amendment. His reasoning: a test of an extension should check what
+the extension controls, which is the dataset, the layout file and which layout is used. A check that the fixed text of
+the chosen layout appears in the output is a valid case of "which layout is used". Any other check of the output belongs
+in a dataset test. So one question about the content is answered, and only with "yes". Part A does not depend on Part B.
+
+### B1. Why
+
+A test can prove from end to end that the layout its code picked is the layout the save used: each layout holds a
+different fixed text, and the test searches the saved Html for it. With Part A alone such a test is never run. The
+reporter's suite has 41 of them (comment of 2026-11-12 07:08 UTC), and his team keeps them for exactly this reason.
+
+### B2. Decision
+
+The session entry of a render (A1) also records the **layout** that A7 resolved and the **certain static texts** of that
+layout. One more question is then answered:
+
+- `T.Contains(X)` answers **true** when all of this holds: `T` holds a mark whose render has a certain static text that
+  contains `X` (ordinal, case-sensitive); that mark has the **whole** form (A1); `X` is a known text of 1 to 250
+  characters, each an ASCII letter or digit.
+- A mark in the **changed** form never answers. So a body that went through `Email Message`.`Create` (P12, the
+  `Regex.Replace`) is not answered: the replacement can rewrite text next to or inside a static text (`rgba(1,2,3,1)` as
+  layout text, or split over runs), and a rule on `X` alone cannot exclude that. A body read before that call (from
+  `Email Item`, from the Temp Blob) is answered. Answering after P12 needs a proof for that transform and probe cells
+  (group P, B5). Owner decision 2026-11-12: not answered after P12 until that probe exists.
+- A static text that contains `rgba(` is dropped from the list, so the list stays right if that decision is taken later.
+- **False is never answered.** When the rule does not give true, the call refuses as in Part A.
+- Everything else refuses as in Part A. `StrPos`, `IndexOf` and their `> 0` forms stay refused: they return a position,
+  and the position is not known. Answering "some position above 0" would need a second kind of unknown value (question 5).
+
+A **certain static text** is the text of one `w:t` element of `word/document.xml` of a Word layout for which all of this holds:
+
+- It is in a paragraph (`w:p`) that is a direct child of `w:body`, or of a table cell that is itself in no content control.
+- No ancestor is a content control (`w:sdt`), so it is in no repeater, no data-bound control and no conditional region.
+- The paragraph holds no field (`w:fldSimple`, `w:fldChar`, `w:instrText`), no drawing, picture or text box, no
+  `mc:AlternateContent`.
+- Neither the run nor the paragraph is hidden (`w:vanish`, `w:webHidden`), the paragraph names no style (`w:pStyle`) and
+  the run names no character style (`w:rStyle`), because a style can hide or re-case text. The run has no `w:caps` and no
+  `w:smallCaps` (the Html may hold the text in upper case). The run is not a deletion or a move (`w:del`, `w:moveFrom`).
+- Document-wide formatting: when `word/styles.xml` cannot be read, or its `w:docDefaults` or its default paragraph style
+  set `w:vanish`, `w:caps` or `w:smallCaps`, the document gives no static texts at all. The same for a document with
+  tracked changes.
+- Headers, footers, footnotes and comments are other parts of the file and are not read.
+- One `w:t` only. Text that Word split over two runs is not joined, because the Html may put markup between the runs.
+
+A layout with no such text, a layout that is not a .docx, a zip or XML that does not parse cleanly, or an encrypted file
+gives an empty list. Then every question refuses as in Part A. The rule names no app, report or text: it reads whatever
+Word layout A7 resolved.
+
+The rows above are the starting rule. The probe of B5 decides each row; a row the probe does not confirm on BC is removed
+before the build, and a row the probe shows to be too strict may be widened only to what the probe measured.
+
+### B3. What it needs
+
+- Reading the layout bytes: the `Tenant Report Layout` row's layout Blob, or the layout file of a declared rendering layout
+  (already loaded for layout export, `al-vm/src/report_layout_export.rs`).
+- A zip reader for one entry and an XML reader. `flate2` (MIT or Apache-2.0) and `quick-xml` (MIT) are already
+  dependencies of the workspace. The zip central directory is read by code of our own or by the reader the Data
+  Compression support already has. No new crate with another license class. The parser is a new module
+  `al-vm/src/report_placeholder/static_text.rs`; it does no OS access.
+- The parse runs once per render and only when a layout was resolved. No cost for other tests.
+
+### B4. Risks
+
+| Risk | Effect | Answer |
+|---|---|---|
+| BC's Word to Html conversion drops, splits, re-encodes or re-cases a static text | a wrong **pass** | Built only on what the probe of B5 shows on BC. Letters and digits only, one `w:t` only. |
+| The layout BC used is not the layout the runtime resolved | a wrong pass on a test whose claim is exactly that | A7 runs Microsoft's selection code as AL. Any doubt in A7 refuses the save, so no static text exists. Probe cell group S of B5 measures it. |
+| A static text sits in a region Word shows only sometimes (styles, section properties, compatibility settings) | a wrong pass | The list of B2 excludes what is known, and a paragraph that names a style is excluded. The probe lists more. |
+| The body was changed after the read (a subscriber replaces text, a `#n` field pads or cuts it) | a wrong pass | Only a mark in the whole form answers (A1). Every allowed row declares its form; P12 gives the changed form, `#n` is refused. A step added later gives the changed form unless it proves it embeds the content unchanged. |
+| A wrong answer here is a wrong pass, not a refusal | trust in a green run | Only "true" is answered, each answer marks an assumption (flagged pass), and the build waits for the probe (question 4). |
+
+### B5. The Windows probe, precisely
+
+The Linux tier of the corpus does not render Word layouts, so the probe runs on the Windows tier. It is one new folder in
+the corpus, written so that a probe agent can start from this text.
+
+Files (folder `tests/al-language/reports/layouts-html-text/`, object ids and prefix from the corpus's free range):
+
+| File | Content |
+|---|---|
+| `HtFixtures.al` | Table `HT Row` (Integer key, `Txt` Text[100]). Report `HT Static Rpt`: one data item on `HT Row`, columns `Txt` and a constant column `Const` with the value `HTCONST1`; `DefaultRenderingLayout` = `HtMain`; rendering layouts `HtMain` (`HtMain.docx`) and `HtOther` (`HtOther.docx`), both Word. A second report `HT Empty Rpt` with the same layout shapes whose data item has a filter that gives 0 rows. |
+| `HtMain.docx`, `HtOther.docx` | Word layouts made by hand in Word from the report's exported XML part. `HtMain.docx` holds the cells of the table below. `HtOther.docx` holds only one body paragraph `HTOTHERLAYOUT1`. |
+| `HtSave.al` | Codeunit `HT Save`: `Save(ReportId; LayoutName; var Body: Text)` sets the layout when a name is given, saves with `Report.SaveAs(ReportId, '', ReportFormat::Html, OutStream)` into a Temp Blob on a UTF-8 stream and reads it with `InStream.Read(Body)`. Also `SaveBytesLog`: length > 0 and the first 15 characters. |
+| `HtStaticTextTests.al` | Test codeunit. One test per cell. Each test observes `Format(Body.Contains(<marker>))` through `Probe Observer` and expects the value BC gives. The expected values are filled in from the first CI run of the probe branch (ADR-007), not guessed. |
+
+Cells in `HtMain.docx`. Every marker is unique, ASCII letters and digits, and appears nowhere else:
+
+| Cell | Where the marker is in the .docx | Question |
+|---|---|---|
+| C1 | plain paragraph, direct child of the body, one run: `HTBODY1` | Is plain body text in the Html, unchanged? |
+| C2 | table cell, no content control: `HTCELL1` | Same for a table cell. |
+| C3 | page header: `HTHEADER1`; page footer: `HTFOOTER1` | Does the Html hold header and footer text? |
+| C4 | plain-text content control bound to column `Const`, placeholder text `HTPLACEHOLDER1` | Is the dataset value `HTCONST1` in the Html, and is the control's placeholder text gone? |
+| C5 | static text `HTINREPEAT1` inside the repeater over the data item, beside the bound `Txt` control | With 2 rows: present. With 0 rows (`HT Empty Rpt`): present or gone? |
+| C6 | static text `HTAFTERREPEAT1` in a body paragraph after the repeater | Present with 0 rows too? |
+| C7 | run with hidden text (`w:vanish`): `HTHIDDEN1`; paragraph in a style whose font is hidden: `HTHIDDENSTYLE1` | Does hidden text reach the Html? |
+| C8 | text inside a plain (unbound) content control: `HTPLAINSDT1` | Is static text in an unbound control kept? |
+| C9 | one word with a format change in the middle (two runs): `HTSPL` bold + `IT1` regular | Does `Contains('HTSPLIT1')` hold, or does markup sit between the runs? |
+| C10 | `HTAMP1 & HTAMP2`, `HTLT1 < HTLT2`, `HTGT1 > HTGT2` in one paragraph each | How are `&`, `<` and `>` written: `Contains('HTAMP1 & HTAMP2')` and `Contains('HTAMP1 &amp; HTAMP2')`, the same for `&lt;` and `&gt;`. |
+| C11 | `HTUML1 äöü é € HTUML2` | Are non-ASCII letters written as they are, as numeric entities or as named entities? One `Contains` per form. |
+| C12 | `HTSP1 HTSP2` with one space, with two spaces, with a non-breaking space, with a tab | Is a space kept as a space? One `Contains` per form. |
+| C13 | `HTFIELD1` beside a merge field or a `DATE` field in one paragraph | Is static text beside a field kept? |
+| C14 | text box: `HTTEXTBOX1`; footnote: `HTFOOTNOTE1` | Do these parts reach the Html? |
+| C15 | `HTCase1` mixed case | Is the case kept (`Contains('HTCase1')`, `Contains('HTCASE1')`)? |
+| C16 | a paragraph with a tracked insertion `HTINS1` and a tracked deletion `HTDEL1` | Which of the two is in the Html? |
+| C17 | a run with all caps (`w:caps`): `HTCaps1`; a run with small caps: `HTSmall1` | Is the text in the Html as typed or in upper case? `Contains` of both forms. |
+| C18 | a run in a character style that hides text: `HTRSTYLEHID1`; a run in a character style with all caps: `HTRStyleCaps1` | Does a character style change what the Html holds? |
+| C19 | a second layout `HtDefaults.docx` whose document defaults set all caps, with one body paragraph `HTDefCaps1` | Do document defaults change the text? |
+| C20 | layout text `HTRGB1 rgba(1,2,3,1) HTRGB2` in one run, and `rgba(1,2,3,` + `1)` split by a format change | What the Html holds before `Email Message`.`Create` and what `GetBody()` holds after it (`Contains('rgba(1,2,3,1)')`, `Contains('rgb(1, 2, 3)')`). |
+
+Cell group S, which layout is used (two tests per row: `Contains('HTBODY1')` and `Contains('HTOTHERLAYOUT1')`):
+
+| Cell | Setup |
+|---|---|
+| S1 | default layout, no selection |
+| S2 | `Report Layout Selection`.`SetTempLayoutSelectedName('HtOther', AppId)` before the save, `ClearTempLayoutSelected` after |
+| S3 | a `Tenant Report Layout` row for the report made from `HtOther.docx` with a GUID as name (the way `UserDefinedWordExcelLayoutRows.al` makes its rows), selected by name with an empty app id |
+| S4 | a `Tenant Report Layout Selection` row that names `HtOther` |
+| S5 | S2 with a name that matches no layout: answer of `SaveAs`, error text and code, output length |
+| S6 | S2 and a logging subscriber to `SubstituteReport`, `SelectReportLayoutCode`, `SelectedBuiltinLayoutType`, `OnDocumentReady`: the events and their order inside `SaveAs` (the value for A7) |
+
+Group P, the Part A claims on real text (A9 probes 1 and 2): after the read in S1, `Body <> ''`, `Format(Body) = Body`,
+TextBuilder and UTF-8 stream round trips equal `Body`, a Blob field stored and read back equals `Body`, and
+`Email Message`.`Create(.., Body, true)` then `GetBody() <> ''` and `GetBody().Contains('HTBODY1')`. Also in group P:
+
+- P-quit: a report whose `OnPreReport` calls `CurrReport.Quit`, saved as Html: the answer of `SaveAs`, `TempBlob.Length() > 0`, `Body <> ''`.
+- P-empty: `HT Empty Rpt` (0 rows): the same three observations, and `Contains('HTBODY1')`.
+- P-order: `('Body ' + Body) < 'body'` and `Body < 'a'`, to keep the culture order of joined text on record.
+- P-length: `TempBlob.Length()` of the Html compared with 0 and logged as "over 1000: yes/no".
+- P-pad: `StrSubstNo('#1########', Body)` equals `'**********'`.
+
+Rules for the probe agent: one observation per `Contains`, no assert that depends on another cell; the .docx files are
+committed binary fixtures like `Y17LayR1.docx`; the tests are Windows-tier only; nothing of Microsoft's is copied.
+
+- Assumption id `report-html-layout-static-text`, marked each time `Contains` answers true from a static text. A test
+  through it is a flagged pass until the probe is in the corpus and the oracle; then the id is removed and the cells are
+  cited in the code.
+
+### B6. Conformance
+
+- Parser tests on small .docx fixtures made for the tests (one per rule of B2).
+- `rendered_text_static_*` tests: true only inside the rule, refusal outside, never false.
+- The reduced fixture of A12 with two layouts and two markers: the right marker passes flagged, the other marker's
+  `Contains` is not run.
+- After the corpus bump: the probe's cells that the rule answers pass; every other cell stays listed as not passing
+  (it asks for false or for text outside the rule), which is the expected state.
+
+## Open questions for the owner (amendment 2026-11-12; answered 2026-11-12, see Status)
+
+1. Accept Part A as written: a rendered Html body may be read whole into a Text, moved and compared with `''`, and every
+   other use refuses?
+2. Accept A7: a save with a temporary layout selection is no longer refused when Microsoft's selection code, run as AL,
+   names a Word layout the runtime can find? Without it, none of the 229 tests reaches the placeholder.
+3. Accept P12: one exact `Regex.Replace` call from `Email Message`.`Create` may run on a marked text? Without it, every
+   `Email Message`.`Create` with a rendered body refuses.
+4. Part B is decided (owner, 2026-11-12). Still open: build it only after the Windows probe of B5 is merged, or before
+   it as a flagged pass? A wrong answer in Part B is a wrong pass, so this text proposes to wait for the probe.
+5. Part B: answer `StrPos(T, X) > 0` and `IndexOf(X) > 0` too? That needs a second unknown value, "a position above 0".
+   This text proposes `Contains` only for now.
+6. `Error` and `Message` with a marked text refuse in step 1. Open `Message` to a MessageHandler that only receives the
+   text when a reported test needs it, or keep it refused?
+
+## Amendment 2026-11-12b: a placeholder's size held in a record field (Proposed)
+
+Status: **Proposed**, not accepted. Nothing is built on it. It changes the accepted rule of the 2026-11-11 implementation
+notes ("a record field" is one of the uses of `Value::PlaceholderSize` that refuse), so it needs the owner's decision.
+
+### The problem
+
+An outside reporter's full run (al-runner issue 6924, comment of 2026-11-12 18:46 UTC) shows 4 tests that passed before the
+placeholder Pdf and are now not run: `storing in a record field of the byte size of a placeholder Pdf of report Purchase -
+Quote` (and Blanket Purchase Order). The store is in the reporter's own app (a mail document method), not in Microsoft's code.
+The tests assert recipients, not the size. They pass on BC. Today the store refuses at once (`interp.rs` `write_as`), so a
+test that never reads the field again is not run.
+
+### Proposal
+
+1. `Rec.F := Size` where `F` is an Integer, BigInteger or Decimal field stores `Value::PlaceholderSize` in the record buffer,
+   as an Integer, BigInteger, Decimal or Variant variable already holds it. Any other field type refuses (`size_convert`).
+2. A read of the field by AL gives the same value back, with the same rules: a comparison with 0 answers (greater), every
+   other use refuses (`size_guard`, `size_order`, `size_convert`).
+3. The value goes with the row: `Insert`, `Modify`, a record assignment, `TransferFields` into an Integer, BigInteger or
+   Decimal field, `Get`/`Find` back. The row store keeps the value as it is (it holds `Value` today; `frozen.rs` names the
+   kind).
+4. Every platform read of the field's value refuses where it happens, with the size refusal text: a filter or a range on the
+   field (`SetRange`, `SetFilter`, a table relation, a FlowFilter), a sort or a key that holds the field, `CalcSums`,
+   a FlowField that sums or looks it up, `Format` of the field (pages, TestPage, `FieldRef.Value` formatted, the change log,
+   report dataset columns, XmlPort, JSON, Excel export), `TestField`, `Validate`, `FieldRef.Value` read into a type other
+   than the three, and record comparison by value. The owner of the check: the row store's value compare (al-data) refuses
+   a `PlaceholderSize` operand, and `format::format` already refuses it; the list above is the test list.
+5. No new assumption: a number stored in a number field is that number on BC, and what the runtime answers about it is
+   only the sign the corpus pins (AMReportOutputTests.al:146, CiReportRunLeads.al:72).
+
+### Alternatives
+
+| Alternative | Why not |
+|---|---|
+| Keep the refusal | The 4 tests stay not run although they never read the size. |
+| Store the placeholder's byte count | A made-up number: `Size > 1000` is true on BC and false here (A4). |
+| Store only in a temporary record | The reporter's table is not known; the rules of point 4 are the same for both. |
+
+### Open questions
+
+1. Accept points 1 to 4, for stored and temporary rows alike?
+2. Point 4 lists the platform reads known today. A read path not listed falls to the row store compare or `format`, which
+   refuse. Is that the guard the owner wants, or must each path get its own test before the change is built?
+
+## Amendment 2026-11-13: the save answer as a table of measured cells, and merged Word text (Accepted, owner 2026-11-13)
+
+Status: Accepted by the owner on 2026-11-13, with the answers recorded under "Owner decisions" below. Replaces the
+hand-written predicates of the amendments of 2026-11-08, 2026-11-11 and 2026-11-12 (A7) by one table; replaces Part B of the
+amendment of 2026-11-12. Built in rounds: step 1 round 1 is the table with today's cells (no change of any answer), round 2
+takes the selection facts from Microsoft's code, round 3 adds the probe's rows and the drop records.
+
+### The problem
+
+A rendering save is answered by hand-written predicates in seven places. Each reads a subset of the facts (how the layouts
+are declared, which layout a selection picks, the data items, the triggers, the extensions, the format, the call form).
+Every review round found a neighbor shape one predicate let through. An outside suite (al-runner issue 6924) has 188 tests
+that only ask whether the save answered and wrote something; they refuse because their combination of facts is in no
+predicate, and the refusal does not say which fact is missing.
+
+### Decision, part 1: the table
+
+1. A save computes one fact vector (al-vm `report_save/facts.rs`). Each fact has one owner that computes it.
+2. The answer is the row of the table whose key matches the vector: saved or not, the error text and code, the kind of the
+   output, whether anything is written, whether the rgba replace of `Email Message.Create` is measured on the render, and
+   which events BC raises that this runtime does not. Each row cites its corpus lines. No row: the save refuses and names
+   every fact that is not measured, with the nearest measured rows.
+3. The facts about layout selection are the answers of the platform events SelectReportLayoutCode,
+   SelectedBuiltinLayoutType and HasCustomLayout. The runtime raises them and Microsoft's ReportManagement answers as AL. The
+   runtime no longer reads table 9651 "Report Layout Selection" itself (round 2; the work ratchet is measured there).
+4. A row that lists measured events raises them to every subscriber. A row without measured events refuses when a
+   subscriber the test can see listens, as before.
+5. A fact may be left out of the match only through a drop record: the fact, the scope it holds in, at least two measured
+   values of the fact that give the same answer, the corner cells where two dropped facts differ together, and one sentence
+   why. One record per lookup. A test checks every record against every row; a new cell that contradicts a record fails the
+   build. An answer through a record marks `report-save-dropped-fact` and stays a flagged pass. This is the one place where
+   the runtime answers a shape no cell measured; it applies to report saves only.
+6. Answers main gives today without a measurement are ordinary rows of the table. They run through an entry of the
+   assumption registry that cites the open probe pull request, as any behavior that waits for its pin, and their cells are
+   part of the step-1 probe plan, so that they become measured. There is no separate row kind and no separate ratchet file.
+7. The content stays a placeholder. Reads of it refuse as in the amendments of 2026-11-11 and 2026-11-12, Part A.
+
+### Decision, part 2: merged Word text (replaces Part B)
+
+1. For a save that a Word layout renders, the runtime merges the layout's `word/document.xml` (and header, footer and
+   footnote parts) with the dataset of the run into known text pieces: static text, values of controls bound to columns,
+   labels, and the content of repeating sections once per row.
+2. `T.Contains(X)` answers true when `T` holds the mark of that render and `X` lies inside one piece. False is never
+   answered. Positions, lengths, equality and parsing refuse as in Part A.
+3. A piece ends wherever BC's output has markup or another character: between two runs, at two spaces, a tab, a no-break
+   space, a line break, and at every element the merge does not understand. The rules are a table of measured cells.
+4. A layout the parser does not understand completely gives no pieces; the render is then opaque as in Part A.
+5. After `Email Message.Create` (the rgba replace) a piece answers only under the rule of the design note (rgba next to a
+   cut).
+6. The text of a Word output (`word/document.xml` read through a zip archive) is built only when a reported test needs it.
+7. No new dependency. `flate2` and `quick-xml` are in the workspace already.
+
+### What stays refused
+
+A Pdf's content, an RDLC render in any format, an Excel workbook's cells, styling, images, pagination, field results, a
+`Contains` that would answer false, and every save whose fact vector is in no row.
+
+### Owner decisions (2026-11-13)
+
+1. Drop records (part 1, point 5): accepted, with evidence. Each record names the fact, the scope, at least two measured
+   values that show the answer does not change, and the corner cells; a test checks every record against every row.
+2. Selection from Microsoft's ReportManagement compiled from source, the events raised to all subscribers, no native read of
+   table 9651 (part 1, point 3): accepted. Built in round 2, with the work ratchet measured there.
+3. No new ratchet file and no separate row kind for the answers main gives without a measurement (part 1, point 6): they are
+   ordinary rows through the assumption registry, and their cells join the step-1 probe plan.
+4. Word output text (part 2, point 6): on demand, not built in step 2 now.
+
+### State after step 1 round 1 (2026-11-13)
+
+Round 1 does not yet do what part 1, point 6 and owner decision 3 describe. It keeps main's answers and main's flags, so
+the rows main answers without a measurement carry `Evidence::Kept` (al-vm `report_save/cell.rs`), a separate row kind
+that marks no assumption:
+
+- Kept rows that refuse (the statement and file forms of `ReportUnsupportedFormat`, OnPostReport after a run with no
+  dataset row) answer nothing; they need no entry.
+- Kept rows that write a placeholder (a same-kind or other-kind selection row under the default layout) are flagged by the
+  placeholder's own assumption entry, not by an entry that cites a probe.
+- Seven Kept rows answer false with `ReportUnsupportedFormat` and no flag, as on main: under a same-kind selection row,
+  a Word layout to Excel, an Excel layout to Pdf, Word and Html, an RDLC layout to Html; under an other-kind selection row,
+  an Excel layout to Pdf and to Word. The table test
+  `report_save_the_kept_rows_that_answer_without_a_flag_are_these_seven` pins this exact set, so a new unflagged Kept row
+  fails the build.
+
+These seven cells join the step-1 probe plan (`docs/probes-needed.md`, row "Report save table, kept cells"). The corpus
+branch `al-runtime-rs-staging-reports-decl` (pull request not open yet) measures one of them: a Word (built-in) selection
+row of the company, Word layout to Excel, answers false with `ReportUnsupportedFormat`. The six cells of Excel and RDLC
+default layouts still need a probe. In the round that opens the step-1 probe pull request, the Kept rows move to an
+assumption entry that cites it, and `Evidence::Kept` is deleted.
+
+### State after step 1 round 2 (2026-11-13)
+
+- **Selection from ReportManagement.** A save that reaches the layout selection raises SelectReportLayoutCode, and then,
+  unless it answered a selected layout, SelectedBuiltinLayoutType (events/platform-triggers/PeVTests.al:713;
+  reports/layouts-html-text/HtRenderedTextTests.al:494, :530). Both go to Base Application's ReportManagement only, not
+  yet to every subscriber as owner decision 2 says; a subscriber of another app stays unseen (follow-up). The runtime reads
+  no row of table 9651: Microsoft's code decides which rows count. A program that holds table 9651 but did not compile
+  ReportManagement's subscriber refuses the save (`report_save::fact_selection::without_report_management`).
+- **Codeunit 9654 still read natively.** The globals of "Design-time Report Selection" are read only to tell a temporary
+  selection from the code of a Custom Layout row, which BC answers differently when the name matches nothing
+  (HtRenderedTextTests.al:543-603 against reports/html-email-body/RxLayoutSelectionTests.al:746), and for the
+  DesignTimeHeld fact of a run (follow-up).
+- **Temporary selection.** Once SelectReportLayoutCode answers a selected name, BC reads no row of the company, so
+  `Selection::TempWord` covers every stored state (RxdDeclLayoutTests.al:811, :1336, :1651; RxdDeclEmailBodyTests.al:199,
+  :329, :407, corpus pull request 1381). Any other answer while a selection was held is `Selection::DesignTimeHeld`.
+- **Declares fact.** A report whose `WordLayout` and `RDLCLayout` properties declare its layouts is its own fact value;
+  its rows (al-vm `report_save/cells_decl.rs`) mark `report-save-decl-word-rdlc` until a bump pins pull request 1381.
+  Kept rows and the statement refusals read the other value, so they are unchanged.
+- **The seven Kept rows are unchanged.** Pull request 1381 measures only the Word-to-Excel one, and only for the
+  declared-properties report, not for the rendering-section shape the Kept row covers.
+
+## Amendment 2026-11-13b: Word layouts rendered by BC's own assemblies (Accepted, owner 2026-11-13)
+
+Status: Accepted by the owner 2026-11-13, with the corrections of the round-0 spike below. Replaces "Decision, part 2:
+merged Word text" of the amendment of 2026-11-13. Changes row 7 of ADR-027 section 3 ("layout rendering" refused by
+design) for Word layouts. Part 1 of that amendment (the table) is unchanged.
+
+### Context
+
+An outside user showed (al-runner issue 7977) that BC's own Word merger and BC's own document converter can be called
+outside the server: public static methods of assemblies in the BC platform artifact. The owner decided on 2026-11-13
+that the runner may call them. The runner uses only assemblies from the BC artifact the user downloads and ships none.
+
+A spike (round 0, Linux, builds 24.5, 27.5, 28.1, 28.5 and 29.1) measured:
+
+- The public overloads are the same on every build measured. The merger has a Stream overload
+  (`MergeWordDocument(Stream, Stream, Stream, string x4, CancellationToken)`) that gives the same `word/document.xml` as
+  its path overload, so no temporary files are needed. The converter has `ConvertToPdf(Stream, Stream)` and
+  `ConvertToHtml(Stream, Stream)`.
+- On Linux the merge works on all three majors (BC 29 on .NET 10 too) with no extra piece for a layout without picture
+  controls. A picture control needs libgdiplus and `System.Drawing.Common` 6.0.0 with Unix support.
+- PDF and Html work on Linux on all three majors. Every conversion loads Aspose.PDF and Aspose.Cells, so the conversion
+  set is about 65 MB to download and 112 MB inflated on Linux (125 to 128 MB on Windows, with the two native libraries).
+- The SkiaSharp version depends on the build, not on the major (28.5 and 29.1 ship 4.152.1; 27.5, 28.1 and 29.0 ship
+  3.119.0). A missing or mismatched Linux `libSkiaSharp.so` raises nothing: pictures are dropped silently. .NET's own
+  search takes a `libSkiaSharp.so` beside `SkiaSharp.dll` or in a system folder before any fallback (review of round 1).
+- The public merger does not raise the section-break error of `streams/CjWordSections.al:138-139`: WordMergeDataItem is
+  server work outside the methods the runner calls.
+- Warm cost per call: merge about 20 ms, PDF about 170 ms. Cold: about 0.35 s and 2.3 s.
+
+### Decision
+
+1. A render process (the .NET helper of ADR-014, started with `--render`, one per run, calls one at a time) offers four
+   requests: `render_probe` (what is available, or the first missing piece by name; every file of a need's set is
+   required by name, from the one list in `al_deps::render_set`), `word_merge` (layout, dataset, title,
+   company), `word_to_pdf`, `word_to_html`. It is reached through an additive capability trait, `ReportRenderer` in
+   `al-host`. Protocol version 6.
+2. The assemblies are found as ADR-014 section 3 says. When no extracted artifact is on disk, two named sets are fetched
+   by range from the platform artifact: the merge set (about 2 MB to download, 7 MB inflated) and the conversion set.
+   Nothing else of the service folder is fetched.
+3. On Linux, `System.Drawing.Common` 6.0.0, `Microsoft.Win32.SystemEvents` 6.0.0 and `libSkiaSharp.so` of the build's own
+   SkiaSharp version are fetched from nuget.org; each file is checked against a SHA-256 kept in the repository.
+   libgdiplus, HarfBuzz, fontconfig and fonts are distribution packages the user installs.
+4. `render_probe` binds SkiaSharp's native imports to the probed Skia native (a resolver set on the SkiaSharp assembly,
+   which runs before .NET's own search) and asks SkiaSharp's own compatibility check on it. A native that does not
+   load, a resolver that cannot be set or a failed check makes PDF and Html unavailable, by name. A picture control
+   needs libgdiplus; without it the merge of such a layout is unavailable, by name (the merge request says whether the
+   layout has picture controls).
+5. Entry-point overloads are a closed table, one row per entry point (24.5 to 29.1): the return type and the parameter
+   types. An overload that is not in it is
+   refused and the refusal prints the parameter list found. "Pass the first N arguments" is not done.
+6. The table of part 1 still decides whether a save is answered, its error and its events. For a row that saves a Word
+   layout as Word, the bytes come from the render process when the layout's shape is one the corpus measured and the
+   process is available. Every other save keeps the placeholder of the amendments of 2026-11-08 and 2026-11-11.
+7. The merge runs at save time. A merger exception whose AL error the corpus pins gives that error. Any other exception
+   refuses the save. A WordMergeDataItem report saved as Word is refused (BC raises an unexpected CLR exception there,
+   corpus pull request 1388).
+8. A real Word output can be opened and its parts read. Its exact size and whole-file comparisons stay refused. A PDF
+   stays opaque. A pass through a real render is a flagged pass until the probe is pinned; a PDF render stays flagged.
+9. PDF conversion inside tests is off by default and turned on by a switch; without it a Pdf save keeps the placeholder.
+   Every PDF the render process makes carries a visible "test output" watermark on every page, with no switch to turn it
+   off. The step that adds it fails closed: no watermark, no PDF. Word output carries no watermark.
+10. Html of a Word layout comes from the same converter only if it reproduces the cells already measured for that Html.
+    Otherwise Html stays as Part A of the amendment of 2026-11-12 describes.
+11. Without the pieces a platform needs, nothing changes from today, and a read of content names the missing piece.
+12. The runtime's own Word merge (`word_merge/`, known text pieces) is not built.
+13. A command that renders one report to PDF without a test (name still open; the design suggests `preview-report`) is
+    built in the first rounds: PDF only, mandatory watermark, a required output folder, one report per call.
+
+### What stays refused
+
+RDLC rendering in any format, Excel layouts, a PDF's content, exact sizes, layout shapes no cell measured, WordMergeDataItem
+reports saved as Word, an unknown overload, and picture merges on a machine without libgdiplus.
+
+### Testing tool
+
+AL Runner is a testing tool, not for production. Rendered output exists inside a test run and is gone when the run ends.
+
+### Consequences
+
+- New: `al-host/src/render.rs` (the trait), `al-testrun/src/report_render.rs` (the process), `al-deps/src/render_set.rs`
+  (the sets and the nuget pieces), `tools/dotnet-sidecar/Render.cs`, later `al-vm/src/report_render/`.
+- Outcomes of tests that read rendered content depend on whether the machine can render. CI requires the renderer.
+- A save that BC's merger rejects is no longer answered "saved".
+
+## Amendment 2026-11-15: the Html of a Word layout made by BC's own merger and converter (Accepted, owner 2026-11-15)
+
+Status: Accepted by the owner on 2026-11-15, with the answers recorded under "Owner decisions (2026-11-15)" below. Makes decision 10 of the amendment of 2026-11-13b concrete for the e-mail body path, and changes what a
+test may read from such a Html (Part A and the rgba column of the amendments of 2026-11-12 and 2026-11-13 no longer apply to
+it). Part 1 of the amendment of 2026-11-13 (the save table) still decides whether a save is answered, its error and its events.
+
+### Context
+
+An outside suite (al-runner issue 6924, comment of 2026-11-13 00:47 UTC) has 229 tests that send a Word layout e-mail body
+through Microsoft's path (`Report Selections`.`SaveReportAsHTML`, `Email Item`, `Mail Management`, `Email Message`.`Create`).
+166 of them stop at `Email Message Impl.`.`ReplaceRgbaColorsWithRgb`: the opaque Html of Part A reaches `Regex.Replace`, and
+the rgba column answers only for the five renders corpus pull request 1371 measured. 41 of the 229 compare the body text
+(`Contains(<language marker>)`), which Part A can never answer.
+
+What BC does for `Report.SaveAs(.., ReportFormat::Html, ..)` of a Word layout, read from the service tier's own code in the
+platform artifact of BC 27.5, 28.1 and 29.1 (`Microsoft.Dynamics.Nav.Ncl.dll`: `ReportResultSetProcessorFactory.GetWordResultSetProcessor`,
+`ReportProcessorWordGenerator`, `ReportResultSetHtmlDecorator`; read locally, nothing of it is committed):
+
+1. The run writes the Xml dataset. With no dataset row BC raises `ReportResultEmpty` (already a row of the save table).
+2. The reporting trigger IntermediateDocumentReady gets the Xml dataset; a subscriber may replace it.
+3. `OfficeWordDocumentMerger.MergeWordDocument(layout, dataset, (Stream)null, "NavWordReportXmlPart",
+   "urn:microsoft-dynamics-nav/reports/", <report caption>, "", token)`: the public Stream overload. For Html and Word the
+   directory overload (the PDF merge of WordMergeDataItem) is off.
+4. BC 29 only: when the feature `DocumentReportExperience` is on and the layout is of subtype Body, the layout is first
+   composed with a header-footer layout and a theme layout (`ComposeDocumentsAsync`). BC 27 and 28 have no such step.
+5. `WordTransformation.ConvertToHtml(docx, html, token)`.
+6. DocumentReady; the post-processing step touches only Pdf; the bytes go to the stream.
+
+The render process of the amendment of 2026-11-13b already calls the methods of steps 3 and 5 from the same artifact.
+
+### Decision
+
+1. **Which saves.** A save renders real Html when all of these hold, each an equality on a measured fact:
+   - its row answers Html written for a Word layout (`Renders::Default` or `Renders::Selected`);
+   - the layout holds no picture control (picture bytes in Html depend on the platform's imaging; measured only later);
+   - no IntermediateDocumentReady subscriber is visible to the test;
+   - on BC 29: the session does not compose (a probe cell measures this on the test tenant; until it is pinned, an assumption);
+   - the renderer has `Merge` and `Html` available;
+   - the report shape is one of the hash cells (decision 4).
+   Every other save keeps Part A unchanged (the opaque value and the rgba column), so no pass is lost on a machine without
+   the renderer.
+2. **How.** `word_merge` with BC's arguments (no output stream, the report's caption, an empty company), then `word_to_html`,
+   at save time. The layout is the app's layout file (`Renders::Default`) or the docx of the Tenant Report Layout row the
+   selection names (`Renders::Selected`). A merger or converter exception refuses the save (no error text is pinned).
+3. **What a test may read.** The Html is plain text: every operation answers, also `Contains` that is false, lengths and
+   equality. This replaces "false is never answered" of the amendment of 2026-11-13 for these renders. Reason: the hash cells
+   pin every byte of the output for each measured shape and major, so nothing is answered that the probe does not cover.
+4. **Evidence.** A probe (corpus file `reports/html-email-body/RxHtmlHashTests.al`, to be opened) observes the SHA-256 and
+   the length of the Html BC writes, and of `Email Message.GetBody()` after `Create`, for the renders corpus pull request 1371
+   already measures (default, three rows, transparent colors, rgba static text, a Tenant Report Layout copy through a
+   temporary selection, two data items, a report extension column, `DefaultLayout = Word`) and one new report with Decimal,
+   Date and `& < > "` values. Until a bump pins it, each pass runs through the assumption `report-html-rendered-by-bc-converter`
+   (flagged), which names these shapes. A shape whose hash differs from the runner's own render on the local observe host is
+   left out of the list: it stays on Part A.
+5. **Gate before building** (decision 10 of the amendment of 2026-11-13b): the runner's render of every hash cell equals BC's
+   hash on 27, 28 and 29. If no cell matches, nothing of this amendment is built and Html stays on Part A.
+6. **Wiring.** The run's renderer reaches the VM as a field of `DotNetConfig` (`Arc<dyn ReportRenderer>`, `NoRenderer` by
+   default): additive.
+7. **Fetching.** Html needs the conversion set (about 65 MB download per build, the same set as PDF). It is fetched by
+   default, not only behind the PDF switch (owner decision 2).
+
+### What stays refused
+
+Html of an RDLC layout (BC raises `ReportUnsupportedFormat`, unchanged), a layout with a picture control, an
+IntermediateDocumentReady subscriber, BC 29 composition until measured, a merger or converter exception, a report shape no
+hash cell covers (Part A applies), and every save the save table does not answer.
+
+### Consequences
+
+- The outside suite's 166 can run through `Create`, and its 41 language tests get a real answer, when their layouts and
+  report shapes are among the hash cells. Layouts with a company logo (a picture control) stay on Part A.
+- Outcomes of these tests depend on whether the machine can render. CI does not require the renderer yet
+  (`--require-report-renderer` of the 2026-11-13b design is not built); the round that builds this adds it.
+- Cost per Html save: the merge (about 20 ms warm) and one conversion (not measured for Html; PDF is about 170 ms warm).
+
+### Owner decisions (2026-11-15)
+
+1. Real Html for the measured shapes, read as plain text (decision 3): accepted. The rgba column of Part A is not widened
+   cell by cell.
+2. The conversion set (about 65 MB per build) is fetched by default, not only when the PDF switch is on. The PDF switch and
+   the mandatory "test output" watermark of every PDF stay as decision 9 of the amendment of 2026-11-13b says.
+
+### Notes, 2026-11-15
+
+- What must equal BC (owner decision of 2026-11-15, "gate inputs, layout free"). The runner hands the layout bytes unchanged
+  to BC's own merger and converter. What must equal BC is every input the runner feeds them, and each input is gated by
+  equality with the probe cells: the call (`Report.SaveAs(Number, '', ReportFormat::Html, OutStream)` with its answer used,
+  no RecordRef, a UTF-8 stream whose buffer holds nothing and was never written by a stream, session language 1033); the
+  save's whole fact vector after the run (`report_save/html_cell.rs`); the report (exactly the properties `UsageCategory =
+  None`, `UseRequestPage = false` and `DefaultRenderingLayout`, so the title, the report's caption, is its name; or those
+  and a plain `Caption`, which is then the title, see the widening below; no request
+  page, label or reportextension; one layout with only `Type = Word` and `LayoutFile`; one data item without view, link,
+  filter fields, `MaxIteration`, `PrintOnlyIfDetail`, `CalcFields` or trigger); the columns and the row count (the measured
+  datasets); the company (empty) and no pictures; the major and the converter version. The dataset values are what the
+  dataset writer writes; its Xml output is pinned also for negative and zero decimals, empty texts and dates and texts with
+  characters Xml escapes (reports/W3ReportObjectIdPreviewLanguage.al:863, reports/dataset/QwTernaryColumns.al:420 and
+  :501, reports/dataset/ReportSaveAsDataItems.al:201), and BC hands that same Xml to the merger (context, steps 1 to 3).
+  Probe cells for these values in the Bound report are still to add.
+- The layout's structure is free: any number, order and nesting of the elements the measured layouts use, any text and
+  attribute values, content controls with or without a binding (a binding must be the row section or one of its columns).
+  A layout feature that makes BC's server do more than merge and convert, or that the merger or converter resolves from
+  outside the file, keeps Part A. The gate keeps the layout to the vocabulary of the measured layouts (their parts,
+  relationship types with internal targets, element names of the document and settings parts, and namespace
+  declarations), which keeps on Part A at least (before the widening below): pictures (image parts, `w:drawing`, `w:pict`,
+  `w:object`, picture controls bound to data); header and footer parts and references (BC 29 composes header-footer and theme layouts for a body layout,
+  context step 4; a layout that declares a `Subtype` keeps Part A too); external targets (`TargetMode="External"`: linked
+  images, hyperlinks, attached templates); fields that pull in other content (`w:fldSimple`, `w:instrText`: INCLUDEPICTURE,
+  INCLUDETEXT, LINK); `w:altChunk` and `w:subDoc`; font, style, numbering and theme parts and embedded fonts, and tabs.
+  No probe cell measured the font, style, numbering and theme parts; tabs and numbering labels take their widths from font
+  metrics. BC's converter (`WordTransformation.ConvertToExternal`) saves with `new HtmlSaveOptions(SaveFormat.Html) {
+  ExportImagesAsBase64 = true }`, so `ResolveFontNames` and `ExportFontResources` keep their default (false) and font names
+  go into the CSS as the file states them; that is the basis for the next widening. A vocabulary is used rather than a list
+  of these features because a list cannot be shown complete; a probe cell widens the vocabulary.
+- BC 29 composition (decision 1, "on BC 29: the session does not compose"). The feature `DocumentReportExperience` is on in
+  a BC 29 test tenant (record/PFFeatureKeyColumns.al:179, `Enabled=All Users`), and BC composes only a layout of subtype
+  Body (context step 4). The gate requires a layout that declares no `Subtype` (subtype Default, as every probe layout), so
+  the feature state is not read (by context step 4 it matters only for a layout of subtype Body).
+- Shapes (corpus pull request 1415, merged, not pinned): two field columns and two rows (Hash_WordAlpha_TwoRows,
+  Hash_WordRgba_TwoRows); and two field columns, a Decimal expression with `AutoFormatType = 1` and a Date expression, one
+  or three rows (Bound_*). An expression column's kind is the kind of value it held on every row of the run; its static
+  type is not known to the gate. It must be an expression of operators or a call with arguments that names no field whose
+  `DecimalPlaces` or caption the dataset reads.
+- Converter version. The pinned builds of BC 27 and 28 carry Aspose.Words 26.8.0; the probe's CI builds carry 26.10.0 and the
+  Html names that version. Until `bc_build` of 27 and 28 moves to builds with 26.10.0 (decided at the bump that pins the
+  probe), the Html saves on those majors keep Part A. The renderer reads the converter assembly's version before it renders,
+  so such a save does not merge and convert only to drop the Html; the version the Html names still decides. al-runner
+  loads the merger and converter only from the user's folders, the extracted artifact of the chosen build itself, or the
+  sets it fetches of that build, never from another extracted build of the major.
+- `--require-report-renderer` is built (al-test-cli and al-runner): a save of a measured shape refuses when the renderer is
+  unavailable, instead of keeping Part A. CI does not pass it yet: CI's setup does not provide the render sets and the Linux
+  pieces.
+
+- Widening (corpus pull request 1419, merged, not pinned; reports/html-email-body/RxHtmlWidenTests.al). Each layout is the
+  bound layout plus one part, and the runner's render equals BC's hashes on 27 and 28 (Aspose.Words 26.10.0, the CI builds'
+  render sets) and 29 (26.8.0), also with the host's Liberation fonts hidden from the process: a styles part with a
+  paragraph style naming a font (the font names go into the CSS), a theme part whose font scheme the document's theme fonts
+  name, and a header part (written before the body, on 29 too: the layout declares no `Subtype`). The vocabulary takes
+  exactly these parts, their relationship types and the element names of each part; it admits `w:headerReference` and does
+  not require it or its type (the converter decides from the file alone whether the header is written). Tabs, footers,
+  other header parts, pictures and every other part still keep Part A. List labels keep Part A too (the numbering part, its
+  relationship, `w:numPr`): the converter pads a label to the indent by the label's width in its font, measured with the
+  fonts of the host it runs on. Numbering_BulletList_NoTabs (:524) gives BC's bytes on a host with Liberation Serif and
+  other bytes without it (14 `&#xa0;` where BC wrote 18), and the label takes the paragraph's font, which styles, document
+  defaults and the theme can name. Admitting list labels needs a host fact first (the converter resolves the label font to
+  the metrics of BC's host). A report `Caption` that is one text literal and states no label attribute (`Locked`,
+  `Comment`, `MaxLength`: no cell measured one; the IR keeps the fact `caption_attributes`) is the title (the merger's
+  title argument), when the report's app ships no translation file of language 1033; `CaptionML` keeps Part A. The
+  four-column dataset is measured with two rows as well. A field column over a field that states any property keeps Part A
+  (it rendered before this widening; no cell measured such a field); BlankZero_IntegerZero (:664) binds another namespace
+  than its report's, so it measures no render of a `BlankZero` field and that field keeps Part A as well.

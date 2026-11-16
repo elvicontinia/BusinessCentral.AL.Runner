@@ -77,6 +77,9 @@ pub enum Virtual {
     Unprovided,
     /// No rows (metadata/platform-tables/Y21EnvColumns.al:30-40 Y21_Printer_NoRows).
     Printer,
+    /// No rows, and every write refused: Table Synch. Setup (al-language-onprem metadata/TableSynchSetupRows.al:275-304, 98208
+    /// TableSynchSetup_RowsAtTestTime; no row at install either, :243-273). Insert and Delete are not measured (:20).
+    TableSynchSetup,
     /// One row, the server instance the session runs on (al-language-onprem
     /// metadata/platform-tables/Y21EnvColumnsOnPrem.al:276-301 Y21_ServerInstance_OwnRow).
     ServerInstance,
@@ -125,6 +128,11 @@ pub const REGISTRY: &[(u32, &str, Provider)] = &[
         Provider::Virtual(Virtual::PageControlField),
     ),
     (2_000_000_039, "Printer", Provider::Virtual(Virtual::Printer)),
+    (
+        2_000_000_135,
+        "Table Synch. Setup",
+        Provider::Virtual(Virtual::TableSynchSetup),
+    ),
     (
         2_000_000_112,
         "Server Instance",
@@ -742,15 +750,7 @@ pub const PINNED_ELSEWHERE: &[(u32, &str, &str)] = &[
 /// before its pin lands, docs/agents/brief.md): they read as pinned ones, and a read lowered from AL code marks the
 /// assumption (`assumption_of_column`). When the bump lands, each moves to `PINNED_ELSEWHERE` (or the generated list) and
 /// its assumption is deleted. As (table id, field id, assumption).
-pub const AWAITING_COLUMNS: &[(u32, u32, crate::assumptions::Assumption)] = &[
-    // Published Application Logo: blank for an app whose manifest declares none, the logo file for a PNG logo, unknown for
-    // any other app (al-vm apps.rs).
-    (
-        2_000_000_206,
-        20,
-        crate::assumptions::Assumption::PublishedApplicationLogoIsTheLogoFile,
-    ),
-];
+pub const AWAITING_COLUMNS: &[(u32, u32, crate::assumptions::Assumption)] = &[];
 
 /// The assumption a read of column `field` of platform table `table` rests on (`AWAITING_COLUMNS`).
 pub fn assumption_of_column(table: u32, field: u32) -> Option<crate::assumptions::Assumption> {

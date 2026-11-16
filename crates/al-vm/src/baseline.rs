@@ -26,7 +26,8 @@ pub struct Baseline {
     last_stamp: i64,
     /// The workspace app's own install codeunits ran once, before this capture (the runner does it once per run, as
     /// publishing an app does, not once per test codeunit): the tables of those that could not run, and why.
-    /// `None`: they did not run here and each test codeunit's session runs them.
+    /// `None`: they did not run here; each test codeunit's session runs them, or starts from what one run of them in a
+    /// session of its own left (al-testrun `install_once.rs`, `Session::install_left`).
     pub workspace_installs: Option<Vec<(std::collections::BTreeSet<u32>, String)>>,
     /// The company data codeunit (Microsoft's DemoTool) built the company to its end before this capture: its setup rows
     /// (General Ledger Setup) are the ones BC's own build writes.
@@ -53,7 +54,7 @@ fn new_origin() -> u64 {
 }
 
 /// The first bytes of a snapshot: what it is and which layout it has. A change of the layout changes the last digit.
-const MAGIC: &[u8; 8] = b"ALBASE\0\x05";
+const MAGIC: &[u8; 8] = b"ALBASE\0\x07";
 
 /// The order of a table's keys (`al_data::memory::PkStorage`): the count of its key fields (0 for text order), then one
 /// byte per field.
@@ -377,7 +378,7 @@ impl Session {
     /// Whether a session restored from a capture of this one now ([`Session::capture_baseline`]) would start exactly as one
     /// restored from `start`, the baseline this session was restored from ([`Session::restore_baseline`] reads nothing
     /// else): no table changed since that restore (the store is `start`'s), the counters, AutoIncrement values, isolated
-    /// storage, number sequences, last stamp, unknown company tables and full copies are `start`'s, and `start` holds no
+    /// storage, number sequences, last stamp, unknown company tables, full copies and group 1 flagged tables are `start`'s, and `start` holds no
     /// built company (a capture does not keep that mark). The install rows a capture is given are those `start` gave
     /// (`Session::install_rows`), and its workspace installs are the caller's to compare.
     pub fn holds_what_it_started_from(&self, start: &Baseline) -> bool {
@@ -463,7 +464,8 @@ impl Session {
 
     pub fn restore_baseline(&mut self, b: &Baseline) {
         let provider = self.store.virtual_tables();
-        self.store = b.store.clone().attached(provider);
+        // The session's store stands for the database whichever store the baseline was taken from.
+        self.store = b.store.clone().attached(provider).as_database();
         self.next_guid = b.next_guid;
         self.next_row_version = b.next_row_version;
         self.tx.committed_row_version = b.committed_row_version;
@@ -473,6 +475,7 @@ impl Session {
         self.isolated_written_in_codeunit.clear();
         self.sequences = b.sequences.clone();
         self.sequences_changed.clear();
+        self.clear_unmeasured();
         // The install ran on a clock that its own Sleep calls had moved forward (hours, in Business Central's install
         // code); the session starts on the real clock again, and a stamp must not stay ahead of it: a row inserted by the
         // first test would otherwise be stamped hours after CurrentDateTime (corpus record/TestSystemFieldStampsContracts.al:

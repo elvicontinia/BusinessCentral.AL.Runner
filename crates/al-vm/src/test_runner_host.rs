@@ -47,6 +47,15 @@ pub(crate) struct RunnerHost {
     base: usize,
 }
 
+impl RunnerHost {
+    /// Holds what a new session holds (`install_left.rs`). Every field is named: a new one does not compile here until
+    /// it is decided.
+    pub(crate) fn as_new(&self) -> bool {
+        let RunnerHost { host, runners, base } = self;
+        host.is_none() && runners.is_empty() && *base == 0
+    }
+}
+
 impl Session {
     /// Runs `f` with `host` installed: while `f` runs, `Codeunit.Run` of a test codeunit from a test runner
     /// codeunit's OnRun goes to `host` (ADR-066 decision 1).
@@ -121,6 +130,7 @@ impl Session {
             let world = std::mem::take(&mut self.tx.tx_world);
             let tries = std::mem::take(&mut self.tx.used_tries);
             let guarded_runs = std::mem::take(&mut self.tx.guarded_runs);
+            let guarded_bodies = std::mem::take(&mut self.tx.guarded_bodies);
             let base = std::mem::replace(&mut self.runner_host.base, self.frames.len());
             // SAFETY: see `with_test_codeunit_host`; the pointer is live while the host is installed.
             let r = unsafe { (*ptr).run_test_codeunit(self, object, runner) };
@@ -137,6 +147,7 @@ impl Session {
             self.tx.tx_world = world;
             self.tx.used_tries = tries;
             self.tx.guarded_runs = guarded_runs;
+            self.tx.guarded_bodies = guarded_bodies;
             self.runner_host.base = base;
             r
         };

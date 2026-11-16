@@ -273,7 +273,11 @@ impl Lowerer<'_> {
                             } else {
                                 text.clone()
                             };
-                            Some(ir::RelationWhere::Value { related: p, text })
+                            Some(ir::RelationWhere::Value {
+                                related: p,
+                                text,
+                                filter: *filter,
+                            })
                         }
                         // One AL string with a doubled quote in it is the filter its content spells: `filter('<>''''')` is
                         // `<>''` (not empty), on a field of the related table and on one a tableextension adds,
@@ -304,6 +308,7 @@ impl Lowerer<'_> {
                             (text != "=''" || equal_empty_pinned).then(|| ir::RelationWhere::Value {
                                 related: p,
                                 text: text.clone(),
+                                filter: true,
                             })
                         }
                         crate::relation::ParsedWhere::QuotedFilter { .. } => None,
@@ -974,15 +979,9 @@ impl Lowerer<'_> {
         for c in &f.conds {
             let pos = src_pos(&c.field)?;
             let decl = src_fields[pos].declared_in.map_or(file, |d| self.ws.objects[d].file);
-            // `"ALT Status"::Active` on an enum field reads as the member (record/qualified-enum-filters/
-            // TestQualifiedEnumFilters.al, al-runner issue 7189).
-            let unqualified = |raw: &str| match &src_fields[pos].ty {
-                Ty::Enum(name) => {
-                    al_builtins::enum_qualifier::strip_enum_qualifier(raw, &crate::types::display_name(name))
-                        .into_owned()
-                }
-                _ => raw.to_string(),
-            };
+            // `"ALT Status"::Active` and `Type::Item` read as the member (`shared::unqualified_member`).
+            let unqualified =
+                |raw: &str| super::shared::unqualified_member(raw, &src_fields[pos].ty, &src_fields[pos].name);
             let value = match &c.value {
                 CondValue::Const(raw) => {
                     let raw = &unqualified(raw);
