@@ -1,0 +1,6 @@
+FieldrefSetrangeScalarOnText => {
+    id: "fieldref-setrange-scalar-on-text",
+    assumed: "FieldRef.SetRange with an Integer, BigInteger, Decimal or Boolean value on a Text or Code field sets the filter to the value's Format text (upper case on a Code field), as one bound or as both bounds of a range; it raises no TypeConversion error. Seen on BC 29 with a partner probe: SetRange(0), SetRange(-7), SetRange(1.5), SetRange(true), SetRange(12345678901L) and SetRange(0, 5) on a Code[20] field give the filters 0, -7, 1.5, YES, 12345678901 and 0..5; SetRange(0) on a Text[30] field gives 0. Other value types (Date, Time, Option, Guid) and Record.SetRange keep the Variant conversion.",
+    tests: "Continia Delivery Network Extended Tests, codeunit 77059 \"Validate Cr. Memo Default Val.\" CheckDefaultValue: FieldRef.SetRange(0) on field 3 of a Code key (reached by Test Sales Cr. Memo To eBill., Test Country Rules for eBill and others).",
+    probe: "A table with Code[20], Text[30] and Code[5] fields: FieldRef.SetRange with Integer, BigInteger, Decimal (1.5, 0.1, 1234567.891), Boolean, Date, Time, Option and Guid values, one bound and two; GetFilter, Count, and the error when the text is longer than the field; the same through Record.SetRange where it compiles.",
+}

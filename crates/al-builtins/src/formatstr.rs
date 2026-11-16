@@ -538,6 +538,10 @@ fn comma_template(v: &Value, length: i32, template: &str, ctx: &dyn FormatCtx) -
                 "<Comma,.><Precision,0:3><Sign><Integer><Decimals>" => {
                     ("<Precision,0:3><Sign><Integer><Decimals>", '.')
                 }
+                t if is_precision_sign_integer_decimals_comma_dot(t) => {
+                    crate::assumptions::assume(crate::assumptions::Assumption::PrecisionSignIntegerDecimals);
+                    (&t[..t.len() - "<Comma,.>".len()], '.')
+                }
                 "<Decimals><Comma,.>" => ("<Decimals>", '.'),
                 "<Comma,.>" => return Ok(crate::format::pad(String::new(), length)),
                 "<Sign><Integer><Decimals><Comma>" => return invalid(),
@@ -607,6 +611,21 @@ fn comma_template(v: &Value, length: i32, template: &str, ctx: &dyn FormatCtx) -
             v.describe()
         )),
     }
+}
+
+/// `<Precision,a:b><Sign><Integer><Decimals><Comma,.>` for any digits a and b (assumption `precision-sign-integer-decimals`;
+/// the pinned precisions have arms of their own in `comma_template`).
+fn is_precision_sign_integer_decimals_comma_dot(template: &str) -> bool {
+    let digits = |s: &str| !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit());
+    template
+        .strip_prefix("<Precision,")
+        .and_then(|rest| rest.split_once('>'))
+        .is_some_and(|(range, tail)| {
+            tail == "<Sign><Integer><Decimals><Comma,.>"
+                && range
+                    .split_once(':')
+                    .is_some_and(|(min, max)| digits(min) && digits(max))
+        })
 }
 
 /// `<Comma,x>` in a format string of a Time or a DateTime (types/date-time/FormatSecondDecComma.al, corpus branch
@@ -771,19 +790,34 @@ fn numeric_of(
             let has_sign = pieces.iter().any(|(is_code, t)| *is_code && t.starts_with("Sign"));
             let vq_pinned = (min, max) == (2, 5) || (!has_sign && matches!((min, max), (0, 5) | (1, 5) | (4, 6)));
             if !precision_2_4 && !vq_pinned && !matches!((min, max), (0, 0) | (0, 3) | (1, 3) | (2, 2) | (3, 3)) {
-                return Err(format!(
-                    "code `<Precision,{min}:{max}>` first without a standard format (not pinned)"
-                ));
+                if !is_sign_integer_decimals(pieces) {
+                    return Err(format!(
+                        "code `<Precision,{min}:{max}>` first without a standard format (not pinned)"
+                    ));
+                }
+                crate::assumptions::assume(crate::assumptions::Assumption::PrecisionSignIntegerDecimals);
             }
         }
-        n.negative_zero = matches!((min, max), (0, 3) | (2, 5))
-            && rounded.is_zero()
-            && n.value.is_sign_negative()
-            && !n.value.is_zero();
+        let rounds_to_negative_zero = rounded.is_zero() && n.value.is_sign_negative() && !n.value.is_zero();
+        let negative_zero_pinned = matches!((min, max), (0, 3) | (2, 5));
+        if rounds_to_negative_zero && !negative_zero_pinned && is_sign_integer_decimals(pieces) {
+            crate::assumptions::assume(crate::assumptions::Assumption::PrecisionSignIntegerDecimals);
+        }
+        n.negative_zero = rounds_to_negative_zero && (negative_zero_pinned || is_sign_integer_decimals(pieces));
         n.value = rounded;
         n.min_decimals = n.min_decimals.max(min);
     }
     Ok(Some(n))
+}
+
+/// Exactly `<Precision,a:b><Sign><Integer><Decimals>`, with no other code and no literal text (assumption
+/// `precision-sign-integer-decimals`).
+fn is_sign_integer_decimals(pieces: &[(bool, &str)]) -> bool {
+    let shown: Vec<&(bool, &str)> = pieces.iter().filter(|(is_code, t)| *is_code || !t.is_empty()).collect();
+    matches!(
+        shown.as_slice(),
+        [(true, p), (true, "Sign"), (true, "Integer"), (true, "Decimals")] if p.starts_with("Precision,")
+    )
 }
 
 fn width(code: &str, name: &str) -> Result<Option<usize>, String> {
