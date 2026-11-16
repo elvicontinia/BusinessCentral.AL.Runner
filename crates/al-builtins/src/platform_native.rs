@@ -283,7 +283,11 @@ fn encoding(encoding: &Value, codepage: &Value, windows_text: bool) -> Result<En
         {
             Ok(Enc::Utf8)
         }
-        1252 if !name.eq_ignore_ascii_case("utf16") => Ok(Enc::Windows1252),
+        // System Application's `FromBase64(Text, TextEncoding)` passes 1252 for every TextEncoding; UTF8 and UTF16 still
+        // decode as UTF-8 and UTF-16 (types/PVBase64.al:137, :139, :141 FromBase64_Text_AndEncodings).
+        1252 if name.eq_ignore_ascii_case("utf8") => Ok(Enc::Utf8),
+        1252 if name.eq_ignore_ascii_case("utf16") => Ok(Enc::Utf16),
+        1252 => Ok(Enc::Windows1252),
         28591 if !name.eq_ignore_ascii_case("utf16") => Ok(Enc::Latin1),
         other => unsupported(format!(
             "Base64 conversion with code page {other} and TextEncoding::{name} (only 0, 1252, 28591 and 65001 are pinned)"
@@ -548,6 +552,9 @@ mod tests {
         assert_eq!(from("w6TDtsO8", "UTF8", 0), "äöü");
         assert_eq!(from("5Pb8", "Windows", 1252), "äöü");
         assert_eq!(from("5Pb8", "UTF8", 0), "\u{FFFD}\u{FFFD}\u{FFFD}");
+        assert_eq!(from("w6TDtsO8", "UTF8", 1252), "äöü");
+        assert_eq!(from("5Pb8", "UTF8", 1252), "\u{FFFD}\u{FFFD}\u{FFFD}");
+        assert_eq!(from("5AD2APwA", "UTF16", 1252), "äöü");
         assert_eq!(from("5Pb8", "Windows", 28591), "äöü");
         assert_eq!(from("5AD2APwA", "UTF16", 0), "äöü");
     }
@@ -590,7 +597,7 @@ mod tests {
     #[test]
     fn unpinned_code_pages_and_characters_are_refused() {
         assert!(matches!(enc("Windows", 850), Err(Signal::Unsupported(_))));
-        assert!(matches!(enc("UTF16", 1252), Err(Signal::Unsupported(_))));
+        assert!(matches!(enc("UTF16", 28591), Err(Signal::Unsupported(_))));
         assert!(matches!(
             encode_text("€", Enc::Windows1252),
             Err(Signal::Unsupported(_))
