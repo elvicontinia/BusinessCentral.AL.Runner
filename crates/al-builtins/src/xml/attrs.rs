@@ -191,17 +191,18 @@ pub(super) fn attrs_set_ns(c: &mut dyn Ctx, r: Option<&mut Value>, a: &mut [Valu
 /// `Set(Name, '', Value)` and `SetAttribute(Name, '', Value)` are the two-argument forms: the attribute has no namespace and
 /// replaces the one of that name in place (xml/WdXmlEmptyNsAndUnassigned.al WD_XmlAttrCollection_Set_EmptyNamespace,
 /// WD_XmlElement_SetAttribute_EmptyNamespace; corpus branch al-runtime-rs-staging-1030c, al-runner issue 6303). Pinned for a
-/// plain name on an element without a namespace; a qualified name or an element in a namespace stays refused.
+/// plain name on an element without a namespace. On an element in a namespace the attribute has no namespace either, as
+/// .NET's `SetAttribute(localName, "", value)` gives it (not pinned, docs/probes-needed.md). A qualified name stays refused.
 pub(super) fn empty_namespace_args(owner: &Handle, a: &[Value]) -> Result<Option<Vec<Value>>, Signal> {
     let (name, ns) = (arg_text(a, 0)?, arg_text(a, 1)?);
     if !ns.is_empty() {
         return Ok(None);
     }
-    let in_ns = with(owner, |d| matches!(d, XData::Element { ns, .. } if !ns.is_empty()));
-    if name.contains(':') || in_ns {
-        return unsupported(
-            "XmlAttributeCollection.Set with an empty namespace URI and a qualified name or on an element in a namespace (not pinned)",
-        );
+    if name.contains(':') {
+        return unsupported("XmlAttributeCollection.Set with an empty namespace URI and a qualified name (not pinned)");
+    }
+    if with(owner, |d| matches!(d, XData::Element { ns, .. } if !ns.is_empty())) {
+        crate::assumptions::assume(crate::assumptions::Assumption::XmlEmptyNamespaceAttributeOnNamespacedElement);
     }
     Ok(Some(vec![a[0].clone(), a[2].clone()]))
 }

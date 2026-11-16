@@ -1,6 +1,8 @@
 //! `HttpClient`: settings, certificates and sending a request to the session.
 
 use super::*;
+use crate::native::HttpPayload;
+use crate::value::HttpHeaderList;
 
 // ------------------------------------------------------------------------------------------------ client
 
@@ -170,12 +172,46 @@ pub(super) fn complete_der(bytes: &[u8]) -> bool {
     header.checked_add(len) == Some(bytes.len())
 }
 
+/// Adds the headers of `bag` to `out`, one pair per value, secret values unwrapped.
+fn add_headers(bag: &HttpHeaderList, out: &mut Vec<(String, String)>) {
+    let bag = bag.borrow();
+    for (name, values) in bag.items.iter().chain(bag.secret.iter()) {
+        out.extend(values.iter().map(|v| (name.clone(), v.clone())));
+    }
+}
+
+/// Adds the headers of the `HttpContent` `content` to `headers` and answers its bytes; `None` when there is no content.
+fn add_content(content: Option<&Value>, headers: &mut Vec<(String, String)>) -> Option<Vec<u8>> {
+    let Some(Value::Library(_, cell)) = content else {
+        return None;
+    };
+    match &*cell.borrow() {
+        LibraryValue::HttpContent(s) if !s.uninitialized => {
+            add_headers(&s.headers, headers);
+            Some(s.data.clone())
+        }
+        _ => None,
+    }
+}
+
+/// What a client sends besides the request itself: its default headers and its timeout.
+fn client_payload(s: &HttpClientState) -> HttpPayload {
+    let mut headers = Vec::new();
+    add_headers(&s.default_headers, &mut headers);
+    HttpPayload {
+        headers,
+        body: None,
+        timeout_ms: s.timeout_ms,
+    }
+}
+
 /// Hands `(method, url)` to the session and writes the response it returns into the `var Response` argument.
 pub(super) fn send(
     c: &mut dyn Ctx,
     method: &str,
     url: (String, bool),
     (cert_validation_set, cert_validation_off, windows_auth_set): (bool, bool, bool),
+    payload: HttpPayload,
     response: Option<&Value>,
 ) -> Out {
     let state = c.http_send(HttpOutgoing {
@@ -186,6 +222,7 @@ pub(super) fn send(
         cert_validation_set,
         cert_validation_off,
         windows_auth_set,
+        payload,
     })?;
     let Some(Value::Library(_, cell)) = response else {
         return unsupported("HttpClient call without a response variable");
@@ -233,7 +270,7 @@ macro_rules! verb {
             if let (true, Some(Value::Library(_, content))) = ($with_content, a.get(1)) {
                 content_handed_on(content);
             }
-            let (base, cert) = with_client(r, |s| {
+            let (base, cert, mut payload) = with_client(r, |s| {
                 (
                     s.base_address.clone(),
                     (
@@ -241,12 +278,16 @@ macro_rules! verb {
                         s.cert_validation_last == Some(false),
                         s.windows_auth_set,
                     ),
+                    client_payload(s),
                 )
             })?;
             let path = text(a, 0)?;
             let url = resolve_request_path(&base, &path)?;
+            if $with_content {
+                payload.body = add_content(a.get(1), &mut payload.headers);
+            }
             let response = if $with_content { a.get(2) } else { a.get(1) };
-            send(c, $method, url, cert, response)
+            send(c, $method, url, cert, payload, response)
         }
     };
 }
@@ -260,7 +301,7 @@ pub(super) fn client_send(c: &mut dyn Ctx, r: Option<&mut Value>, a: &mut [Value
     if let Some(Value::Library(_, req)) = a.first() {
         request_handed_on(req);
     }
-    let (base, cert) = with_client(r, |s| {
+    let (base, cert, mut payload) = with_client(r, |s| {
         (
             s.base_address.clone(),
             (
@@ -268,6 +309,7 @@ pub(super) fn client_send(c: &mut dyn Ctx, r: Option<&mut Value>, a: &mut [Value
                 s.cert_validation_last == Some(false),
                 s.windows_auth_set,
             ),
+            client_payload(s),
         )
     })?;
     let Some(Value::Library(_, req)) = a.first() else {
@@ -285,7 +327,11 @@ pub(super) fn client_send(c: &mut dyn Ctx, r: Option<&mut Value>, a: &mut [Value
                 "HttpClient.Send of a request with cookies set by SetCookie (what a handler sees is not pinned)",
             );
         }
-        LibraryValue::HttpRequest(s) => (s.method.clone().unwrap_or_else(|| "GET".into()), s.uri.clone()),
+        LibraryValue::HttpRequest(s) => {
+            add_headers(&s.headers, &mut payload.headers);
+            payload.body = add_content(s.content.as_ref(), &mut payload.headers);
+            (s.method.clone().unwrap_or_else(|| "GET".into()), s.uri.clone())
+        }
         LibraryValue::Empty => ("GET".into(), None),
         other => return unsupported(format!("HttpClient.Send of {}", other.describe())),
     };
@@ -295,5 +341,5 @@ pub(super) fn client_send(c: &mut dyn Ctx, r: Option<&mut Value>, a: &mut [Value
         Some(uri) => resolve_request_path(&base, &uri)?,
         None => (String::new(), false),
     };
-    send(c, &method, url, cert, a.get(1))
+    send(c, &method, url, cert, payload, a.get(1))
 }

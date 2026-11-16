@@ -109,7 +109,9 @@ pub(crate) fn manifest_digest(m: &Manifest) -> [u8; 32] {
 /// The second text is the frame of the key: all of it but the source of the apps (`KeyBuilder::finish_frame`), what a
 /// warm server's baseline carried over an edit must match (`baseline_cache::carry`).
 ///
-/// Not kept at all: a run that lets `File` use a real directory (`--files-dir`), reads the real clock as it goes,
+/// Not kept at all: a run with App Key Vault secrets (`--app-secrets`: install code may store a secret in a table), a
+/// run whose requests go out for real (`--allow-network`: what the install code received is in no key),
+/// a run that lets `File` use a real directory (`--files-dir`), reads the real clock as it goes,
 /// records, compares two executable forms or has a test runner of its own, and a baseline whose install code made a
 /// `DotNet` call that may read more than its arguments (`Engine::dotnet_called`): what such a run reads is not in the key. Test data is in the key by what
 /// its provider says it is (`TableProvider::identity`). Nothing the tests write is kept: the file is written before
@@ -132,6 +134,8 @@ pub(super) fn baseline_key(
         || suites.iter().any(|s| s.runner.is_some())
         || crate::host::uses_real_files()
         || crate::host::real_clock()
+        || crate::host::uses_app_secrets()
+        || crate::host::uses_network()
     {
         return None;
     }

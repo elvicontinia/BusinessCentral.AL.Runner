@@ -564,6 +564,17 @@ pub fn test_timeout_env_set() -> bool {
         .any(|var| std::env::var(var).is_ok_and(|v| !v.trim().is_empty()))
 }
 
+/// The App Key Vault secrets and where they came from: `--app-secrets`, else `ALRUNNER_APP_SECRETS`.
+fn app_secrets(a: &TestArgs) -> Result<Option<(al_host::AppSecrets, String)>, String> {
+    if let Some(path) = &a.app_secrets {
+        return crate::app_secrets::read(path).map(|s| Some((s, path.display().to_string())));
+    }
+    match std::env::var("ALRUNNER_APP_SECRETS") {
+        Ok(v) if !v.trim().is_empty() => crate::app_secrets::from_variable(&v).map(Some),
+        _ => Ok(None),
+    }
+}
+
 /// The test time limit in seconds: `--test-timeout-secs` (a recipe lane sets it, see
 /// [`RECIPE_TEST_TIMEOUT_SECS`]), else `ALRUNNER_TEST_TIMEOUT`, else AL Runner v2's `AL_RUNNER_TEST_TIMEOUT_SEC`,
 /// else [`DEFAULT_TEST_TIMEOUT_SECS`].
@@ -1053,6 +1064,28 @@ fn test_inner(
     al_testrun::host::set_company_name(a.company_name.clone());
     if let Some(dir) = &a.files_dir {
         al_testrun::host::set_files_dir(dir.clone());
+    }
+    if let Some((secrets, from)) = app_secrets(a)? {
+        if !a.quiet {
+            eprintln!(
+                "app secrets: {} secrets for {} apps from {from}",
+                secrets.secret_count(),
+                secrets.app_count()
+            );
+        }
+        al_testrun::host::set_app_secrets(secrets);
+    }
+    if a.allow_network {
+        if !a.quiet {
+            eprintln!("network: requests that no test handler answers go to the real server (--allow-network)");
+        }
+        al_testrun::host::set_network(std::sync::Arc::new(al_testrun::network::UreqNetwork::new()));
+    }
+    if a.skip_partner_login {
+        if !a.quiet {
+            eprintln!("login: the partner dependency apps' OnAfterLogin subscribers do not run (--skip-partner-login)");
+        }
+        al_testrun::host::set_skip_partner_login();
     }
     // Fail on an unwritable output path before the long part, not after it.
     if let Some(p) = &a.junit {

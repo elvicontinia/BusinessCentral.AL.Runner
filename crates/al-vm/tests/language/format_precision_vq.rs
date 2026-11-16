@@ -68,5 +68,24 @@ fn refused(value: &str, f: &str) -> bool {
 #[test]
 fn unpinned_pairs_stay_refused() {
     assert!(refused("1.2", "<Precision,2:7><Integer><Decimals>"));
-    assert!(refused("-3.5", "<Precision,4:6><Sign><Integer><Decimals>"));
+    assert!(refused("-3.5", "<Precision,4:6><Integer><Decimals><Sign>"));
+}
+
+/// Exactly `<Precision,a:b><Sign><Integer><Decimals>` formats for any precision (assumption
+/// `precision-sign-integer-decimals`, partner probe on BC 29), and a negative value that rounds to zero keeps its sign.
+#[test]
+fn precision_sign_integer_decimals_any_precision() {
+    let f = "<Precision,2:3><Sign><Integer><Decimals>";
+    for (v, want) in [
+        ("0.005", "0.005"),
+        ("-0.0004", "-0.00"),
+        ("12.3456", "12.346"),
+        ("-1234.56789", "-1234.568"),
+        ("2.5", "2.50"),
+    ] {
+        assert_eq!(fmt(v, f), want, "{v}");
+    }
+    assert_eq!(fmt("-0.0004", "<Precision,0:2><Sign><Integer><Decimals>"), "-0");
+    assert_eq!(fmt("-0.0004", "<Precision,2:2><Sign><Integer><Decimals>"), "-0.00");
+    assert_eq!(fmt("-3.5", "<Precision,4:6><Sign><Integer><Decimals>"), "-3.5000");
 }

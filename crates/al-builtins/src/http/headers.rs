@@ -292,7 +292,8 @@ pub(super) fn headers_keys(_: &mut dyn Ctx, r: Option<&mut Value>, _: &mut [Valu
     Ok(Value::List(Rc::new(RefCell::new(keys.into()))))
 }
 
-/// `GetValues(Name, var Values)` fills an array or a list with the values in order and answers true. For a name that is not
+/// `GetValues(Name, var Values)` writes the values in order into an array from its first element, or adds them after what a
+/// list holds, and answers true. For a name that is not
 /// there it answers false, leaves the target as it was and puts the error in GetLastErrorText when its result is used, and raises
 /// that error as a statement (http/content/HttpContent.al:OldHeadersHandle_AfterWriteFrom, :226 with :281-283 and :270 with
 /// :290-291, on content headers; http/HttpHeaders.al:GetValuesOnMissingLeavesArray for the result).
@@ -349,10 +350,11 @@ pub(super) fn headers_get_values(c: &mut dyn Ctx, r: Option<&mut Value>, a: &mut
                 arr[i] = Value::Text(v.into());
             }
         }
+        // A list keeps what it held: the values are added after it (xml/xml/P97HdrGetValues.al:GetValues_List_Overload,
+        // `prefilled_hit` 'Yes|2|pre;a;').
         Some(Value::List(list)) => {
-            let mut list = list.borrow_mut();
-            list.clear();
-            list.extend(values.into_iter().map(|v| Value::Text(v.into())));
+            list.borrow_mut()
+                .extend(values.into_iter().map(|v| Value::Text(v.into())));
         }
         other => return unsupported(format!("HttpHeaders.GetValues into {}", other.describe())),
     }

@@ -15,9 +15,11 @@
 //! `CreateDateTime` and `Format` read a `DateTime` in UTC too. There is no zone offset to
 //! configure, so the date part of `CurrentDateTime` always equals `Today`.
 
+mod app_secrets;
 pub mod dotnet;
 pub mod inproc;
 pub mod license;
+pub mod network;
 pub mod random;
 pub mod render;
 pub mod seed;
@@ -25,6 +27,8 @@ pub mod testdata;
 pub mod time_zone_table;
 pub mod tz;
 pub mod windows_zones;
+
+pub use app_secrets::AppSecrets;
 
 /// The wall clock.
 pub trait Clock {
@@ -883,6 +887,10 @@ pub struct Host {
     /// How far each read of the clock by AL code moves it, in milliseconds (ADR-045: 1; ADR-058 `clock.stepMs`).
     /// Always positive: two reads must differ.
     pub clock_step_ms: i64,
+    /// The App Key Vault secrets of the run (`--app-secrets`); `None`: no app has a key vault.
+    pub app_secrets: Option<std::sync::Arc<AppSecrets>>,
+    /// Real outbound HTTP (`--allow-network`); `None`: a request no test handler answers is refused (ADR-027).
+    pub network: Option<std::sync::Arc<dyn network::Network>>,
 }
 
 /// The seed a session's `Random` starts from on the default host.
@@ -898,6 +906,8 @@ impl Host {
             guid_seed: None,
             run_seed: seed::FIXED_RUN_SEED,
             clock_step_ms: 1,
+            app_secrets: None,
+            network: None,
         }
     }
 
@@ -950,6 +960,18 @@ impl Host {
             inner: self.identity,
             o,
         });
+        self
+    }
+
+    /// The same host whose apps have the App Key Vault secrets given (`--app-secrets`).
+    pub fn with_app_secrets(mut self, secrets: std::sync::Arc<AppSecrets>) -> Host {
+        self.app_secrets = Some(secrets);
+        self
+    }
+
+    /// The same host whose requests that no test handler answers go out for real (`--allow-network`).
+    pub fn with_network(mut self, network: std::sync::Arc<dyn network::Network>) -> Host {
+        self.network = Some(network);
         self
     }
 

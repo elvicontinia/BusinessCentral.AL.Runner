@@ -750,6 +750,53 @@ fn the_key_vault_provider_without_a_key_vault_raises_the_pinned_errors() {
     assert_eq!(host.log(), vec![]);
 }
 
+/// `run` on a host that serves the App Key Vault secrets given (`--app-secrets`).
+fn run_with_app_secrets(secrets: al_host::AppSecrets, vars: &str, body: &str, ret: &str) -> Ran {
+    let (program, blocked, oi, ri) = compile(vars, body, ret);
+    let engine = Engine::with_dotnet(program, blocked, cfg(&no_host()));
+    let mut s = Session::with_host(engine, al_host::Host::default().with_app_secrets(Arc::new(secrets)));
+    let inst = s.instance(oi);
+    let result = s.call(oi, ri, inst, vec![]).map(|(v, _)| v);
+    Ran {
+        result,
+        session: Some(s),
+    }
+}
+
+/// With `--app-secrets`, the calling app's key vault is the secrets file: a mapped name answers true and its value, an
+/// unmapped one false and '' (System Application "App Key Vault Secret Pr. Impl." GetSecret: "It will return false in
+/// these cases, and set SecretValue=''").
+#[test]
+fn the_key_vault_provider_serves_the_secrets_of_the_calling_app() {
+    let mut secrets = al_host::AppSecrets::default();
+    secrets.add("a", "api-secret", "s3cr3t");
+    let r = run_with_app_secrets(
+        secrets,
+        "P: DotNet AkvProvider; S: Text; Found: Boolean; Missing: Text;",
+        "P := P.AzureKeyVaultAppSecretProvider(); P.InitializeFromCallingAppExceptSystemApplication(); \
+         Found := P.TryGetAzureKeyVaultSecret('api-secret', S); \
+         Missing := 'was set'; \
+         exit(Format(Found) + '|' + S + '|' + Format(P.TryGetAzureKeyVaultSecret('other', Missing)) + '|' + Missing);",
+        ": Text",
+    );
+    assert_eq!(text(r), "Yes|s3cr3t|No|");
+}
+
+/// Secrets of other apps do not give the calling app a key vault: the pinned error stays.
+#[test]
+fn the_key_vault_provider_without_secrets_for_the_calling_app_raises_the_pinned_error() {
+    let mut secrets = al_host::AppSecrets::default();
+    secrets.add("another app", "api-secret", "s3cr3t");
+    let r = run_with_app_secrets(
+        secrets,
+        "P: DotNet AkvProvider;",
+        "P := P.AzureKeyVaultAppSecretProvider(); asserterror P.InitializeFromCallingAppExceptSystemApplication(); \
+         exit(GetLastErrorText());",
+        ": Text",
+    );
+    assert!(text(r).starts_with("No key vaults specified for extension 'a by "));
+}
+
 #[test]
 fn a_key_vault_provider_variable_never_constructed_is_not_instantiated() {
     let host = Fake::new(|r| panic!("the host must not be called: {r:?}"));

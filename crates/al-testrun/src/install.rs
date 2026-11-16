@@ -1936,7 +1936,13 @@ fn run_install_code(
     match called {
         Ok(()) => Ok(true),
         Err(Signal::Unsupported(r)) => Err(stopped(r.into_reason(), true)),
-        Err(Signal::Error(e)) => Err(stopped(format!("failed (behaviour not pinned): {}", e.message), false)),
+        Err(Signal::Error(e)) => {
+            // The reason carries no stack (it is folded and counted); this shows where the install code failed.
+            if std::env::var_os("ALRUNNER_INSTALL_STACK").is_some() {
+                eprintln!("install routine failed: {}\n{}", e.message, e.call_stack);
+            }
+            Err(stopped(format!("failed (behaviour not pinned): {}", e.message), false))
+        }
         Err(_) => Ok(false),
     }
 }

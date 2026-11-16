@@ -199,6 +199,12 @@ pub struct TestArgs {
     /// refuses when the report renderer is unavailable, instead of keeping the opaque Html.
     pub require_report_renderer: bool,
     pub files_dir: Option<PathBuf>,
+    /// `--app-secrets FILE` (else `$ALRUNNER_APP_SECRETS`, a file or the JSON itself): the App Key Vault secrets of the apps.
+    pub app_secrets: Option<PathBuf>,
+    /// `--allow-network`: a request that no test handler answers goes out for real instead of being refused.
+    pub allow_network: bool,
+    /// `--skip-partner-login`: the partner dependency apps' `OnAfterLogin` subscribers do not run in the test session.
+    pub skip_partner_login: bool,
     /// `--license FILE` (serve: `license`): the BC license the run uses instead of the BC artifacts' (ADR-060).
     pub license: Option<PathBuf>,
     /// `--environment saas|onprem`: what Environment Information answers (default saas, as probed).
@@ -1207,7 +1213,22 @@ OTHER
                          per-company install code of the apps under test runs once in each company, then
                          the per-database part (ADR-046). Default: one company, the session company.
     --files-dir DIR      Let the File data type read and write real files under DIR.
-    --license FILE       The BC license file (.bclicense) the run uses: a developer, partner or
+    --app-secrets FILE   The App Key Vault secrets of the apps (else $ALRUNNER_APP_SECRETS): a JSON
+                         object that maps an app id or app name to an object of secret names and
+                         text values. An app listed there initializes App Key Vault Secret Provider
+                         and gets its values; a name it does not list answers false and ''. No real
+                         key vault is reached.
+                         The file is read for this run only; the install baseline is not kept on
+                         disk, and no value is printed. Fill the file from the vault in the
+                         pipeline and delete it after the run.
+    --skip-partner-login Do not run the OnAfterLogin subscribers of partner dependency apps in the test
+                         session (BC runs them). For partner apps whose login code changes state the
+                         runner cannot watch; every test of such a run is flagged.
+    --allow-network      Send a request that no [HttpClientHandler] answers to the real server
+                         (default: refused, the test is not run). The test then depends on that
+                         server: its outcome can change between runs. The install baseline is not
+                         kept on disk.
+    --license FILE      The BC license file (.bclicense) the run uses: a developer, partner or
                          customer license. Default: the license in the BC artifacts of the run's
                          build. License Permission reads answer from it. The file is read for
                          this run only, never copied or cached. A file that cannot be read stops
@@ -1244,6 +1265,8 @@ OTHER
 ENVIRONMENT
     ALRUNNER_CACHE       The cache folder when --cache-dir is not given.
     ALRUNNER_SERVER_URL  The address --server-url sets, when it is not given.
+    ALRUNNER_APP_SECRETS The file --app-secrets names, when it is not given. A value that starts
+                         with { is the JSON itself, so no secrets file is needed.
     ALRUNNER_NO_COMPILE_CACHE=1, ALRUNNER_NO_CACHE_PRUNE=1  See COMPILE CACHE.
     ALRUNNER_BCAPPS_URL  The address --recipe fetches BCApps from.
     ALRUNNER_NO_PATH_NOTE=1  No note about another al-runner on PATH (AL Runner v2's dotnet tool has
@@ -1671,6 +1694,9 @@ pub fn parse(args: impl IntoIterator<Item = String>) -> Result<Command, String> 
             "--quiet" | "-q" => a.quiet = true,
             "--timings" => a.timings = true,
             "--files-dir" => a.files_dir = Some(text()?.into()),
+            "--app-secrets" => a.app_secrets = Some(text()?.into()),
+            "--allow-network" => a.allow_network = true,
+            "--skip-partner-login" => a.skip_partner_login = true,
             "--license" => a.license = Some(text()?.into()),
             "--environment" => a.environment = Some(text()?.parse().map_err(|e| format!("--environment: {e}"))?),
             "--companies" => {

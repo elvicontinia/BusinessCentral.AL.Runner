@@ -35,6 +35,30 @@ pub struct HttpOutgoing {
     pub cert_validation_off: bool,
     /// The client had Windows authentication set: a request no `[HttpClientHandler]` answers is not pinned.
     pub windows_auth_set: bool,
+    /// What goes on the wire when the request goes out for real (`--allow-network`).
+    pub payload: HttpPayload,
+}
+
+/// The headers, body and timeout of an outgoing request. Values can be secrets: `Debug` shows names and sizes only.
+#[derive(Clone, Default)]
+pub struct HttpPayload {
+    /// The client's default headers, the request's headers and the content's headers, secret values unwrapped.
+    pub headers: Vec<(String, String)>,
+    /// The content's bytes; `None` when the request has no content.
+    pub body: Option<Vec<u8>>,
+    /// The client's `Timeout`, in milliseconds.
+    pub timeout_ms: i64,
+}
+
+impl std::fmt::Debug for HttpPayload {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let names: Vec<&str> = self.headers.iter().map(|(n, _)| n.as_str()).collect();
+        f.debug_struct("HttpPayload")
+            .field("headers", &names)
+            .field("body_len", &self.body.as_ref().map(Vec::len))
+            .field("timeout_ms", &self.timeout_ms)
+            .finish()
+    }
 }
 
 /// A table as `Evaluate` into a TableFilter reads it (see [`Ctx::table_filter_table`]).

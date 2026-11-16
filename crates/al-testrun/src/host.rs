@@ -93,6 +93,47 @@ pub fn set_files_dir(dir: PathBuf) {
     let _ = FILES_DIR.set(dir);
 }
 
+/// The App Key Vault secrets `--app-secrets` gave, if any. Set once at start-up.
+static APP_SECRETS: OnceLock<std::sync::Arc<al_host::AppSecrets>> = OnceLock::new();
+
+/// Gives the apps of the run the App Key Vault secrets read from `--app-secrets FILE`.
+pub fn set_app_secrets(secrets: al_host::AppSecrets) {
+    let _ = APP_SECRETS.set(std::sync::Arc::new(secrets));
+}
+
+/// Whether the run has App Key Vault secrets. Such a run keeps no install baseline on disk: the install code may
+/// write a secret into a table, and a secret must not end up in the cache.
+pub fn uses_app_secrets() -> bool {
+    APP_SECRETS.get().is_some()
+}
+
+/// The network of `--allow-network`, if any. Set once at start-up.
+static NETWORK: OnceLock<std::sync::Arc<dyn al_host::network::Network>> = OnceLock::new();
+
+/// Lets a request that no test handler answers go out for real (`--allow-network`).
+pub fn set_network(network: std::sync::Arc<dyn al_host::network::Network>) {
+    let _ = NETWORK.set(network);
+}
+
+/// Whether requests go out for real. Such a run keeps no install baseline on disk: what the install code received is
+/// not in any key.
+pub fn uses_network() -> bool {
+    NETWORK.get().is_some()
+}
+
+/// `--skip-partner-login`: the partner dependency apps' login subscribers do not run in the test session.
+static SKIP_PARTNER_LOGIN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Leaves out the partner dependency apps' `OnAfterLogin` subscribers in the test session (`--skip-partner-login`).
+pub fn set_skip_partner_login() {
+    SKIP_PARTNER_LOGIN.store(true, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Whether the partner dependency apps' login subscribers are left out ([`set_skip_partner_login`]).
+pub fn skips_partner_login() -> bool {
+    SKIP_PARTNER_LOGIN.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 /// The environment `--environment` named. Set once at start-up; the default is the probed SaaS-like sandbox.
 static ENVIRONMENT: OnceLock<al_host::Environment> = OnceLock::new();
 
@@ -245,6 +286,14 @@ fn host_in_company_perturbed(start: Option<i64>, company: Option<&str>, p: &crat
             .unwrap_or_else(|| ENVIRONMENT.get().copied().unwrap_or_default()),
     );
     let host = host.with_server_url(&server_url().0);
+    let host = match APP_SECRETS.get() {
+        Some(secrets) => host.with_app_secrets(secrets.clone()),
+        None => host,
+    };
+    let host = match NETWORK.get() {
+        Some(network) => host.with_network(network.clone()),
+        None => host,
+    };
     match FILES_DIR.get() {
         Some(dir) => host.with_files(DirFileSystem::new(dir.clone())),
         None => host,
