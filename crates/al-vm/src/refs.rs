@@ -180,9 +180,9 @@ impl Session {
     }
 
     fn lock_through_recordref(&mut self, locked_before: bool, what: &'static str) {
-        if !locked_before && self.tx.lock_tx {
-            self.tx.lock_tx = false;
-            self.tx.lock_unpinned = Some(what);
+        if !locked_before && self.tx.open.locks.lock_tx {
+            self.tx.open.locks.lock_tx = false;
+            self.tx.open.locks.lock_unpinned = Some(crate::state::UnpinnedLock::Other(what));
         }
     }
 
@@ -901,15 +901,23 @@ impl Session {
     }
 
     pub(crate) fn recordref_op(&mut self, method: &str, lib: &Lib, args: &mut [Value]) -> Result<Value, Signal> {
-        // A RecordRef on a table whose filter group 1 another record set (records.rs `global_group_check`).
-        if !self.global_group1.is_empty() && method != "FilterGroup" {
-            if let LibraryValue::RecordRef(rec) = &*lib.borrow() {
-                let table = rec.borrow().table;
-                self.global_group_check(rec, table, &format!("RecordRef.{method}"))?;
+        // A RecordRef on a table whose filter group 1 holds an entry (`group1_sessions.rs`).
+        let mut group1 = None;
+        if self.global_group1.has_tables()
+            && let LibraryValue::RecordRef(rec) = &*lib.borrow()
+        {
+            let table = rec.borrow().table;
+            let op = crate::group1_sessions::Group1Op::RecordRef(method);
+            // Only a shared read holds the record for the call: GetTable counts the handles of a row (recordref_variant.rs).
+            if let use_ @ crate::group1_sessions::Group1Use::Shared { .. } = self.group1_use(rec, table, op, args)? {
+                group1 = Some((rec.clone(), use_));
             }
         }
         let new_ref_tried = crate::unopened_refs::open_attempt_on_new_ref(method, &lib.borrow());
-        let r = self.recordref_op_inner(method, lib, args);
+        let r = match group1 {
+            Some((rec, use_)) => self.with_group1(&rec, use_, |s| s.recordref_op_inner(method, lib, args)),
+            None => self.recordref_op_inner(method, lib, args),
+        };
         if new_ref_tried {
             crate::unopened_refs::after_open_attempt(method, lib, &r);
         }
@@ -966,18 +974,9 @@ impl Session {
                     // case 1140): a copy of its table, buffer, filters and current row, not shared afterwards
                     // (recordref-fieldref/AsRecRefGetTable.al:35-106). A ref that is not open is a Conversion error and
                     // leaves the target unopened (AsRecRefGetTable.al:110 FromNotOpen).
-                    Some(Value::Library(name, other)) => match &*other.borrow() {
-                        LibraryValue::RecordRef(r) => r.clone(),
-                        l if not_open(l) && name.eq_ignore_ascii_case("RecordRef") && from_variant => {
-                            return Err(Signal::Error(Box::new(AlError {
-                                message: "Unable to convert from Microsoft.Dynamics.Nav.Runtime.NavRecordRef to Microsoft.Dynamics.Nav.Runtime.INavRecordHandle.".into(),
-                                code: "Conversion".into(),
-                                call_stack: String::new(),
-                                ..Default::default()
-                            })));
-                        }
-                        _ => return unsupported("RecordRef.GetTable of a RecordRef that is not open"),
-                    },
+                    Some(Value::Library(name, other)) => {
+                        self.get_table_ref_source(&lib.borrow(), name, &other.borrow(), from_variant, args.first())?
+                    }
                     other => {
                         if from_variant && let Some(e) = self.get_table_variant_not_record(&lib.borrow(), other) {
                             return Err(e);
@@ -1093,7 +1092,7 @@ impl Session {
                 // record/PWFilterGroupOr.al:OrGroup_RecordRef).
                 Self::filter_group(&rec, args)
             }
-            "GetFilters" => self.get_filters(&rec, &t).map(|s| Value::Text(s.into())),
+            "GetFilters" => self.get_filters(&rec, &t, false).map(|s| Value::Text(s.into())),
             "GetView" => {
                 let use_names = match args.first() {
                     Some(v) => ops::truthy(v)?,
@@ -1122,20 +1121,20 @@ impl Session {
                     return unsupported("RecordRef.LockTable after a ReadIsolation was set (not pinned)");
                 }
                 let mut a: Vec<Value> = args.iter().take(1).cloned().collect();
-                let locked = self.tx.lock_tx;
+                let locked = self.tx.open.locks.lock_tx;
                 let r = self.record_meta_op(RecordOp::LockTable, &rec, &t, &mut a);
                 // On an open database table it starts the write transaction, a read keeps it and a Commit ends it; on a
                 // temporary table it starts none (recordref-fieldref/WcRecordRefLockTable.al:28-87). What else follows from it
                 // (the stale-buffer shapes and the rest that read `lock_tx`) is pinned for Record.LockTable only.
-                let started = !locked && self.tx.lock_tx;
+                let started = !locked && self.tx.open.locks.lock_tx;
                 self.lock_through_recordref(locked, "a RecordRef.LockTable");
                 if started {
-                    self.tx.recref_lock_tx = true;
+                    self.tx.open.locks.recref_lock_tx = true;
                 }
                 r
             }
             "ReadIsolation" => {
-                let locked = self.tx.lock_tx;
+                let locked = self.tx.open.locks.lock_tx;
                 let r = self.record_meta_op(RecordOp::ReadIsolation, &rec, &t, args);
                 self.lock_through_recordref(locked, "a locking RecordRef.ReadIsolation");
                 r

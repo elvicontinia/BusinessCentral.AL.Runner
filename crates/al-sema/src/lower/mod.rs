@@ -265,6 +265,11 @@ pub(crate) struct Lowerer<'a> {
     /// The Label-typed variables declared `TextConst`, by lowercase name (a Label and a TextConst share `Ty::Label`).
     global_textconsts: std::collections::HashSet<String>,
     local_textconsts: std::collections::HashSet<String>,
+    /// The Label and TextConst variables of the forms [`shared::plain_text_constant`] names, by lowercase name.
+    global_plain_text_constants: std::collections::HashSet<String>,
+    local_plain_text_constants: std::collections::HashSet<String>,
+    /// The Variant variables of the routine's `var` section, by lowercase name (no parameter, no named return value).
+    local_variant_vars: std::collections::HashSet<String>,
     /// The TextConst variables whose text depends on the language in force, by lowercase name: their texts by language
     /// code ([`shared::textconst_languages`]).
     global_textconst_languages: HashMap<String, Vec<(String, String)>>,
@@ -331,6 +336,8 @@ pub(crate) struct Lowerer<'a> {
     loops: Vec<bool>,
     /// `by_var` of the parameters of the routine being lowered.
     var_params: Vec<bool>,
+    /// The slot of the named return value of the routine being lowered.
+    named_ret: Option<usize>,
     /// The routine being lowered reads MaxStrLen of a `var` parameter, or hands one on to a `var` parameter
     /// (`ir::Routine::reads_var_max_len`).
     reads_var_max_len: bool,
@@ -619,6 +626,7 @@ mod copy_array;
 mod coverage_ids;
 mod dotnet;
 mod dotnet_arg;
+mod evaluate_id;
 mod expr;
 mod ext_order;
 mod ext_request_page;
@@ -642,6 +650,7 @@ mod test_handlers;
 #[cfg(test)]
 mod tests;
 mod tys;
+mod var_option_arg;
 mod with_events;
 
 /// What the lowering does with a `CreateInStream` call that creates a handed-back InStream on a local of the routine.

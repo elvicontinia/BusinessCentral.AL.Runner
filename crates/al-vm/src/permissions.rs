@@ -1359,6 +1359,9 @@ impl Session {
                     if self.system_flowfield_reads_unchecked(rec, table, stack) {
                         return Ok(());
                     }
+                    if self.published_app_calc_denied(table, stack) {
+                        return Err(self.denial_error(access, "IndirectRead", "Read", by));
+                    }
                     return Err(Signal::unsupported(unpinned_denial(
                         access,
                         "a FlowField over a system table",
@@ -1591,6 +1594,9 @@ impl Session {
         }
         if !from_al {
             return refuse("made by the runtime for a page, report, xmlport or validation; ADR-062 probes P16-P18");
+        }
+        if access.op == Op::Read && self.trigger_setup_read_unchecked(method, rec, access)? {
+            return Ok(());
         }
         if access.id >= 2_000_000_000 && access.id != TENANT_MEDIA {
             return refuse("on a system table; probe P13 pins Tenant Media only");
@@ -1881,6 +1887,10 @@ impl Session {
 
     /// `CountApprox` answers as `Count`. The gate ran for CountApprox, so `Count` passes it again with the same answer.
     pub(crate) fn count_approx(&mut self, rec: &crate::records::Rec) -> Result<al_builtins::value::Value, Signal> {
+        // The Count below would raise a deferred Insert error as Count does; for CountApprox that is not measured.
+        if !rec.borrow().temporary {
+            self.refuse_unmeasured_read_while_deferred(rec.borrow().table as usize, "CountApprox")?;
+        }
         self.permission_from_al = self.permission_checks();
         self.record_op(al_builtins::record_op::RecordOp::Count, rec, &mut [])
     }

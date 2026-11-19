@@ -1,9 +1,11 @@
 //! Running the test codeunits of one compiled program, each test on a session of its own.
 use super::al_runner::run_unit;
 use super::written::{
-    self, ReachFacts, ReachIndex, reach_facts, remainder_reach_facts, settled_flags, unfinished_reach_facts,
+    self, ReachFacts, ReachIndex, remainder_reach_facts, settled_flags, test_reach_facts, unfinished_reach_facts,
 };
 use super::*;
+// What a reader of a table a skipped install holds on assumption gets (`blocked.rs` `Assumed`).
+use super::Assumed::{Marked, Refused};
 
 /// Outcomes of every `[Test]` procedure of test codeunit `object`, in order.
 pub fn run_codeunit(engine: &Arc<Engine>, lowered: &Lowered, object: usize) -> Vec<(String, Outcome)> {
@@ -34,12 +36,27 @@ pub fn run_codeunit_isolated(
 
 /// What an observer sees of a test that has just ended.
 pub struct Observed<'a> {
-    /// The session, with its fault site (tracing is on when there is an observer).
+    /// The session.
     pub session: &'a Session,
+    /// Where the error or the refusal of the test was raised from, outermost first (tracing is on when there is an observer).
+    pub site: &'a [al_vm::FaultFrame],
     /// The error that failed the test.
     pub error: Option<&'a AlError>,
     /// The routine a refusal decided before the run belongs to (object, routine).
     pub refused_in: Option<(usize, usize)>,
+}
+
+impl<'a> Observed<'a> {
+    /// A test that ran: the site is the session's.
+    fn of_test(session: &'a Session, error: Option<&'a AlError>, refused_in: Option<(usize, usize)>) -> Self {
+        let site = session.fault_site();
+        Observed {
+            session,
+            site,
+            error,
+            refused_in,
+        }
+    }
 }
 
 /// Called with the test's name and outcome after each test of the codeunit that ran.
@@ -181,9 +198,9 @@ fn open_company(
     lowered: &Lowered,
     session: &mut Session,
     mode: Option<bool>,
-    skipped_installs: &[(BTreeSet<u32>, String)],
+    skipped_installs: &[al_vm::SkippedInstall],
     perturb: &crate::stability::Perturb,
-) -> Result<(crate::install::CompanyOpenWrites, al_builtins::assumptions::HitBits), String> {
+) -> Result<(crate::install::CompanyOpenWrites, al_builtins::assumptions::HitBits), crate::install::NotOpened> {
     // A scratch run is not a test session: it opens nothing.
     let Some(disabled) = mode else {
         return Ok(Default::default());
@@ -204,10 +221,49 @@ fn open_company(
     Ok((wrote, al_builtins::assumptions::take_hit_bits()))
 }
 
+/// The session enters test codeunit `object` after the install code: the settings of its isolation, and the refusal of
+/// every NumberSequence call when an earlier codeunit's numbers are not known here (`Scratch::numbers_unmeasured`).
+fn enter_test_codeunit(session: &mut Session, scratch: &Scratch, object: usize, isolation: TestIsolation) {
+    if let Some(why) = &scratch.numbers_unmeasured {
+        session.mark_numbers_unmeasured(std::rc::Rc::from(&**why));
+    }
+    session.mark_install_end();
+    session.in_test_codeunit = true;
+    session.isolation_from_hub = scratch.hub && isolation != TestIsolation::Codeunit;
+    // StartSession starts a session under Disabled isolation, from the hub (RqIsolationModes.al:573-600) and from a runner
+    // (corpus PR 735, SdIsolStartSession.Codeunit.al:20-22): refused there, as no second session is modelled.
+    session.hub_disabled = isolation == TestIsolation::Disabled;
+    session.test_object = Some(object);
+}
+
+/// Every test of the codeunit (`all`) not run, when the code that opens the company did not end (`not`). `--explain`:
+/// each test shows the stack the call that did not end left from, or the subscriber refused at lowering, as a test
+/// refused while it ran or before it does (al-runner issue 8142).
+fn observed_not_run(
+    observe: Option<&mut Observer>,
+    session: &Session,
+    not: &crate::install::NotOpened,
+    all: impl Fn(Outcome) -> Vec<(String, Outcome)>,
+) -> Vec<(String, Outcome)> {
+    let refused = all(Outcome::NotRun(not.why.clone()));
+    if let Some(observe) = observe {
+        let seen = Observed {
+            session,
+            site: &not.site,
+            error: None,
+            refused_in: not.refused_in,
+        };
+        for (name, outcome) in &refused {
+            observe(name, outcome, &seen);
+        }
+    }
+    refused
+}
+
 /// The tables `watched` and those of `skipped_installs` (`skipped_install_tables`), for the store's watch.
 fn with_skipped<'a>(
     watched: impl Iterator<Item = &'a u32>,
-    skipped_installs: &[(BTreeSet<u32>, String)],
+    skipped_installs: &[al_vm::SkippedInstall],
 ) -> BTreeSet<u32> {
     let mut out: BTreeSet<u32> = watched.copied().collect();
     out.extend(skipped_install_tables(skipped_installs));
@@ -217,19 +273,49 @@ fn with_skipped<'a>(
 /// The reason of the first skipped install that wrote a table `routine` can reach. The tables the routine reaches are
 /// found once, and only when an install was skipped: the walk of its calls cost as much as the test for every skipped install.
 fn skipped_install_touching<'a>(
-    skipped_installs: &'a [(BTreeSet<u32>, String)],
+    skipped_installs: &'a [al_vm::SkippedInstall],
     lowered: &Lowered,
     object: usize,
     routine: usize,
+    assumed: Assumed,
 ) -> Option<&'a String> {
     if skipped_installs.is_empty() {
         return None;
     }
     let touched = tables_touched(lowered, object, routine);
-    skipped_installs
-        .iter()
-        .find(|(tables, _)| !tables.is_disjoint(&touched))
-        .map(|(_, why)| why)
+    let refuses = |s: &al_vm::SkippedInstall| {
+        !s.tables.is_disjoint(&touched) || (assumed == Assumed::Refused && !s.assumed.is_disjoint(&touched))
+    };
+    skipped_installs.iter().find(|s| refuses(s)).map(|s| &s.why)
+}
+
+/// Runs `body`, a test method's body, and notes in `committed` whether a commit ran inside it (its AL Commit(), or one
+/// its code causes).
+fn noting_commits<T>(session: &mut Session, committed: &mut bool, body: impl FnOnce(&mut Session) -> T) -> T {
+    let from = session.commits;
+    let out = body(session);
+    *committed |= session.commits != from;
+    out
+}
+
+/// The runner commits a test that passes: with a table still marked by Consistent(false) what BC does there is not pinned
+/// (only Commit() is, errors/CuCommitTests.al:405-419), so the test is not run. `handled`: every handler the test
+/// declares ran.
+fn refuse_inconsistent_end<T>(
+    session: &Session,
+    result: Result<T, Signal>,
+    model: al_vm::TxModel,
+    handled: bool,
+) -> Result<T, Signal> {
+    match result {
+        Ok(_) if model != al_vm::TxModel::AutoRollback && handled => match session.inconsistent_table() {
+            Some(t) => Err(Signal::unsupported(format!(
+                "the test ends while Consistent(false) marks table {t}: the runner's commit is not pinned"
+            ))),
+            None => result,
+        },
+        r => r,
+    }
 }
 
 /// The data-driven tests of a codeunit: procedures with `[TestDataSource(Codeunit, DataSet)]` and no `[Test]`.
@@ -425,13 +511,7 @@ fn run_codeunit_inner(
     );
     // What install code wrote is known only in part (ADR-046): the tests read it through the facts of this engine.
     crate::install::ensure_facts(engine, lowered);
-    session.mark_install_end();
-    session.in_test_codeunit = true;
-    session.isolation_from_hub = scratch.hub && isolation != TestIsolation::Codeunit;
-    // StartSession starts a session under Disabled isolation, from the hub (RqIsolationModes.al:573-600) and from a runner
-    // (corpus PR 735, SdIsolStartSession.Codeunit.al:20-22): refused there, as no second session is modelled.
-    session.hub_disabled = isolation == TestIsolation::Disabled;
-    session.test_object = Some(object);
+    enter_test_codeunit(&mut session, scratch, object, isolation);
     // Company Triggers when the test session opens the company, before the codeunit's OnRun and first test (ADR-046
     // amendment 1, A4 item 10). What the step relied on counts for every test of the session
     // (`mark_test_start_assumptions`).
@@ -440,7 +520,7 @@ fn run_codeunit_inner(
     let opened = open_company(engine, lowered, &mut session, mode, &skipped_installs, &perturb);
     let (company_open, company_open_marks) = match opened {
         Ok(opened) => opened,
-        Err(why) => return all(Outcome::NotRun(why)),
+        Err(not) => return observed_not_run(observe.as_deref_mut(), &session, &not, all),
     };
     // SingleInstance state an earlier test codeunit left (ADR-066 amendment 2): notes from here on, and in the lane the
     // single instances of the codeunit before are moved in.
@@ -476,11 +556,12 @@ fn run_codeunit_inner(
     // The tables an earlier Disabled codeunit left rows in (`Scratch::leak`): a read of one is noted, and the codeunit
     // then runs again from what that codeunit left (`corpus.rs`).
     let leak: BTreeSet<u32> = scratch.leak.as_deref().cloned().unwrap_or_default();
-    // The reach facts of a routine of this codeunit, for the writes of the Company Triggers subscribers.
+    // The reach facts of a routine of this codeunit and the handler functions it names, for the writes of the Company
+    // Triggers subscribers.
     let company_open_refuses = |r: usize| -> Option<String> {
         company_open.who.as_ref()?;
         let index = engine.derived(|| ReachIndex::new(&engine.events, lowered));
-        company_open.refuses(&reach_facts(&engine.events, lowered, &index, object, r), lowered)
+        company_open.refuses(&test_reach_facts(&engine.events, lowered, &index, object, r), lowered)
     };
     // A test codeunit with SingleInstance = true runs its tests on the session's single instance: a variable of its own type
     // and its manual subscriber share its globals, and the second test sees what the first left
@@ -539,7 +620,7 @@ fn run_codeunit_inner(
             let hits = session.store_mut().watch_hits();
             scratch.leak_hit |= !leak.is_disjoint(&hits);
             session.store_mut().watch(Default::default());
-            if let Some((_, why)) = skipped_install_hit(&skipped_installs, &hits) {
+            if let Some((_, why)) = skipped_install_hit(&skipped_installs, &hits, Refused) {
                 return Err(on_run_refused(format!("OnRun: {why}")));
             }
             (partner.after_on_run(&hits, lowered)).map_err(|why| on_run_refused(format!("OnRun: {why}")))?;
@@ -576,7 +657,7 @@ fn run_codeunit_inner(
                         ))));
                     }
                     // The error may come from install data this run does not have: it is not trusted.
-                    if let Some(why) = skipped_install_touching(&skipped_installs, lowered, object, on_run) {
+                    if let Some(why) = skipped_install_touching(&skipped_installs, lowered, object, on_run, Refused) {
                         return Err(on_run_refused(format!(
                             "OnRun failed after install code that did not run: {why}"
                         )));
@@ -606,6 +687,9 @@ fn run_codeunit_inner(
         let checkpoint = (isolation == TestIsolation::Function).then(|| Checkpoint::take(session));
         // Under Codeunit isolation a failed test takes back the NumberSequence.Insert calls since here (isolation::after_test).
         let sequences_at_start = (isolation == TestIsolation::Codeunit).then(|| session.sequences_at_start());
+        // Whether a commit ran inside a test method body of this codeunit since then (its AL Commit(), or one its code
+        // causes); the runner's own commits around the method do not count.
+        let mut body_committed = false;
         // MinimumActiveRowVersion across the tests (al-vm `min_row_version.rs`). When OnRun wrote rows, whether they belong to
         // the isolation transaction is not pinned, and no value is taken.
         if !execute && runner.none_handed_out(session, row_versions_from) {
@@ -722,7 +806,7 @@ fn run_codeunit_inner(
             } else if let Some(b) = blocked_site(lowered, object, r) {
                 refused_in = Some((b.object, b.routine));
                 Outcome::NotRun(b.text)
-            } else if let Some(reason) = skipped_install_touching(&skipped_installs, lowered, object, r) {
+            } else if let Some(reason) = skipped_install_touching(&skipped_installs, lowered, object, r, Marked) {
                 Outcome::NotRun(reason.clone())
             } else if let Some(reason) = company_open_refuses(r) {
                 Outcome::NotRun(reason)
@@ -829,18 +913,20 @@ fn run_codeunit_inner(
                                     &routine.name,
                                     at,
                                     &mut cases_ok,
-                                    |session| match &case {
-                                        None => session.call(object, r, instance.clone(), Vec::new()),
-                                        Some((source, index, id)) => data_driven::run_case(
-                                            session,
-                                            lowered,
-                                            object,
-                                            r,
-                                            instance.clone(),
-                                            source,
-                                            *index,
-                                            id,
-                                        ),
+                                    |session| {
+                                        noting_commits(session, &mut body_committed, |session| match &case {
+                                            None => session.call(object, r, instance.clone(), Vec::new()),
+                                            Some((source, index, id)) => data_driven::run_case(
+                                                session,
+                                                lowered,
+                                                object,
+                                                r,
+                                                instance.clone(),
+                                                source,
+                                                *index,
+                                                id,
+                                            ),
+                                        })
                                     },
                                 )
                             })),
@@ -905,19 +991,7 @@ fn run_codeunit_inner(
                         };
                         session.tx_model = al_vm::TxModel::AutoCommit;
                         let unexecuted = session.end_ui_scope();
-                        // The runner commits a test that passes: with a table still marked by Consistent(false) what BC does there
-                        // is not pinned (only Commit() is, errors/CuCommitTests.al:405-419), so the test is not run.
-                        let result = match result {
-                            Ok(_) if model != al_vm::TxModel::AutoRollback && unexecuted.is_empty() => {
-                                match session.inconsistent_table() {
-                                    Some(t) => Err(Signal::unsupported(format!(
-                                        "the test ends while Consistent(false) marks table {t}: the runner's commit is not pinned"
-                                    ))),
-                                    None => result,
-                                }
-                            }
-                            r => r,
-                        };
+                        let result = refuse_inconsistent_end(session, result, model, unexecuted.is_empty());
                         // A duplicate-key Insert whose error is still deferred when the test ends: the next access to the
                         // table or a Commit raises it (record/TestRecordRuntimeTextsAndViews.al:180-209). At the end of the
                         // test the runner raises it: the test fails with the error, whose AL call stack has no frame of the
@@ -1044,7 +1118,9 @@ fn run_codeunit_inner(
             // A test that read or wrote a table install code that could not run touches, through a path its record
             // variables do not show (a RecordRef): not run, as the static check does for a record variable (al-runner
             // issue 8115, scenario s03b).
-            let skipped_hit = skipped_install_hit(&skipped_installs, &touched).filter(|_| began);
+            let skipped_hit = began
+                .then(|| skipped_install_hit(&skipped_installs, &touched, Marked))
+                .flatten();
             let outcome = match (hit.and_then(|t| company_open.touched(t, lowered)))
                 .or_else(|| skipped_hit.map(|(_, why)| why.clone()))
             {
@@ -1119,7 +1195,7 @@ fn run_codeunit_inner(
                             // An unknown part of the earlier reach answers without this test's reach.
                             let later = match facts.unknown {
                                 Some(_) => &ReachFacts::default(),
-                                None => mine.get_or_insert_with(|| reach_facts(&engine.events, lowered, index, object, r)),
+                                None => mine.get_or_insert_with(|| test_reach_facts(&engine.events, lowered, index, object, r)),
                             };
                             facts.changes_read_by(later, checkpoint.is_none(), drew, &settled, lowered).map(|what| {
                                 let how = match u.ended {
@@ -1191,11 +1267,7 @@ fn run_codeunit_inner(
                 observe(
                     &name,
                     &outcome,
-                    &Observed {
-                        session,
-                        error: failure.as_ref(),
-                        refused_in,
-                    },
+                    &Observed::of_test(session, failure.as_ref(), refused_in),
                 );
             }
             crate::isolation::after_test(
@@ -1204,6 +1276,7 @@ fn run_codeunit_inner(
                 runner_function,
                 sequences_at_start.as_ref(),
                 failed,
+                body_committed,
                 &routine.name,
             );
             if let (Outcome::Fail(_), Some(e)) = (&outcome, &failure) {
@@ -1356,7 +1429,7 @@ fn discover(
     lowered: &Lowered,
     object: usize,
     company_open: &crate::install::CompanyOpenWrites,
-    skipped_installs: &[(BTreeSet<u32>, String)],
+    skipped_installs: &[al_vm::SkippedInstall],
     scratch: &mut Scratch,
     limit: Option<std::time::Duration>,
 ) -> Vec<(String, Outcome)> {
@@ -1419,7 +1492,7 @@ fn carry_disabled(
     object: usize,
     routines: impl Iterator<Item = usize> + Clone,
     changes_from: u64,
-    skipped_installs: &[(BTreeSet<u32>, String)],
+    skipped_installs: &[al_vm::SkippedInstall],
 ) {
     let obj = &lowered.program.objects[object];
     let mode = if runner_disabled {

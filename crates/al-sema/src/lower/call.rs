@@ -2,6 +2,11 @@
 use super::*;
 use al_syntax::ast::NodeText;
 
+/// Whether `r` is the bare name `CurrPage`.
+fn is_currpage_name(r: &SyntaxNode) -> bool {
+    r.kind() == SyntaxKind::NameRef && r.text_string().trim().eq_ignore_ascii_case("CurrPage")
+}
+
 impl Lowerer<'_> {
     fn prepare_call_resolution(
         &mut self,
@@ -13,30 +18,81 @@ impl Lowerer<'_> {
         if let Some(Res::Builtin(id)) = &resolution {
             self.system_function_named_like_a_rec_field(node, receiver)?;
             self.coverage_test_id_call(id, receiver, args)?;
-            if id == "Page.SaveRecord#1"
-                && self.ws.objects[self.oi].kind == ObjKind::Page
-                && receiver.is_some_and(|r| {
-                    r.kind() == SyntaxKind::NameRef && r.text_string().trim().eq_ignore_ascii_case("CurrPage")
-                })
-                && args.is_empty()
-                && crate::members::has_internal_parameterless_save_record(self.ws, self.oi)
-            {
-                // `CurrPage.SaveRecord()` on a ListPart that declares an internal parameterless SaveRecord calls the
-                // platform method, not the procedure (pages/lifecycle/TestCurrPageSaveRecordName.al:13-37, page
-                // TestCurrPageSaveRecordName1Fixture51744.al:9,28,53). Other page types are not measured.
-                let list_part = self.ws.object_ast(self.oi).properties().any(|p| {
-                    p.name().eq_ignore_ascii_case("PageType") && p.value_text().trim().eq_ignore_ascii_case("ListPart")
-                });
-                if !list_part {
-                    return Err(
-                        "CurrPage.SaveRecord() on a page other than a ListPart that declares an internal SaveRecord \
-                         procedure (which one BC calls is pinned on a ListPart only)"
-                            .to_string(),
-                    );
-                }
-            }
+            let currpage = receiver.is_some_and(is_currpage_name);
+            crate::own_named_page_methods::save_record_refusal(self.ws, self.oi, id, currpage, args.len())?;
         }
+        self.own_named_caption(node, receiver, resolution.as_ref())?;
         Ok(resolution)
+    }
+
+    /// `own_named_caption` for `target`, the target of an assignment.
+    pub(crate) fn own_named_caption_target(&mut self, target: &SyntaxNode) -> L<()> {
+        let receiver = (target.kind() == SyntaxKind::MemberExpr)
+            .then(|| target.first_child())
+            .flatten();
+        let res = self.res(target).cloned();
+        self.own_named_caption(target, receiver.as_ref(), res.as_ref())
+    }
+
+    /// `Caption` on a page that declares procedures named Caption: runs where BC 29.0 was measured, through the
+    /// assumption, and refuses elsewhere (`own_named_page_methods::caption_gate`). `node` is the call, or the member or
+    /// name read or assigned.
+    fn own_named_caption(
+        &mut self,
+        node: &SyntaxNode,
+        receiver: Option<&SyntaxNode>,
+        resolution: Option<&Res>,
+    ) -> L<()> {
+        use crate::own_named_page_methods::{CaptionGate, CaptionReceiver, caption_gate, request_page_caption_refusal};
+        let callee = match node.kind() {
+            SyntaxKind::CallExpr => node.first_child().ok_or("callee")?,
+            _ => node.clone(),
+        };
+        let member = match callee.kind() {
+            SyntaxKind::MemberExpr => callee.children().nth(1),
+            SyntaxKind::NameRef => Some(callee.clone()),
+            _ => None,
+        };
+        if !member.is_some_and(|m| m.text_string().trim().trim_matches('"').eq_ignore_ascii_case("Caption")) {
+            return Ok(());
+        }
+        let currpage = receiver.is_some_and(is_currpage_name);
+        if receiver.is_none() || currpage {
+            request_page_caption_refusal(self.ws, self.oi, node, currpage)?;
+        }
+        let (kind, page) = match receiver {
+            None => match self.ws.objects[self.oi].kind {
+                ObjKind::Page => (CaptionReceiver::Bare, Some(self.oi)),
+                ObjKind::PageExtension => (CaptionReceiver::Bare, self.ws.extension_target(self.oi)),
+                _ => return Ok(()),
+            },
+            Some(r) if r.kind() == SyntaxKind::NameRef => match self.ty_ref(r) {
+                Ty::Object(ObjKind::Page, name) => {
+                    let kind = if currpage {
+                        CaptionReceiver::CurrPage
+                    } else {
+                        CaptionReceiver::PageVariable
+                    };
+                    (kind, self.resolve_obj(ObjKind::Page, name).ok())
+                }
+                _ => return Ok(()),
+            },
+            Some(_) => return Ok(()),
+        };
+        let Some(page) = page else { return Ok(()) };
+        let platform = matches!(resolution, Some(Res::Builtin(_)));
+        let proc = match resolution {
+            Some(Res::Proc { object, offset }) => Some((*object, *offset)),
+            _ => None,
+        };
+        match caption_gate(self.ws, self.oi, page, kind, node, platform, proc) {
+            CaptionGate::Keep => Ok(()),
+            CaptionGate::Assume(a) => {
+                self.assume(a);
+                Ok(())
+            }
+            CaptionGate::Refuse(why) => Err(why),
+        }
     }
 
     /// `Rec.SecurityFiltering()` read on a variable declared with `[SecurityFiltering(...)]` answers the declared value on
@@ -377,11 +433,7 @@ impl Lowerer<'_> {
                     None => return Err("implicit calls into another object are not lowered yet".into()),
                 };
                 // The routine node is the one `routine_at` numbered, so no search by offset.
-                let try_call = self
-                    .routine_nodes
-                    .get(object)
-                    .get(routine)
-                    .is_some_and(|r| r.attributes().any(|a| a.name().eq_ignore_ascii_case("tryfunction")));
+                let try_call = self.routine_has_attribute(object, routine, &["tryfunction"]);
                 let receiver_kind = match &receiver_node {
                     Some(r) if instance.is_some() => match self.ty_of(r) {
                         Ty::Object(k, _) => Some(k),
@@ -399,6 +451,9 @@ impl Lowerer<'_> {
                     }
                     if p.by_var {
                         let arg = self.by_var_arg(a)?;
+                        if let Some(why) = self.var_option_arg_refusal(Some((object, routine)), &p.ty, a, &arg) {
+                            return Ok(ir::Expr::Refused(format!("call `{}`: {why}", node.text())));
+                        }
                         // A `var` Text or Code parameter handed on to another `var` parameter keeps the declared length of the
                         // first caller's variable or field (text/text-methods/MaxStrLen.Codeunit.al:146-170,
                         // PYC_MaxStrLen_VarParameterHops; to an event's subscribers too, :172-201): the routine takes the
@@ -443,7 +498,20 @@ impl Lowerer<'_> {
                             out.push(ir::Arg::Value(value));
                             continue;
                         }
-                        self.refuse_variant_argument(&p.ty, a)?;
+                        let local_proc = self
+                            .routine_nodes
+                            .get(object)
+                            .get(routine)
+                            .is_some_and(|r| r.is_local() && r.attributes().next().is_none());
+                        let site = if receiver_node.is_none() && instance.is_none() && object == self.oi && local_proc && !try_call {
+                            super::convert::TextConstantSite::ArgumentOfSameObjectProcedure
+                        } else {
+                            super::convert::TextConstantSite::Other
+                        };
+                        if let Some(textconst) = self.refuse_variant_argument(&p.ty, a, site)? {
+                            out.push(ir::Arg::Value(self.text_constant(value, textconst)?));
+                            continue;
+                        }
                         // A Text or Code handed to a by-value Text or Code parameter of a TryFunction is converted by the callee's
                         // binding, inside the try: a text too long for a Code[20] parameter makes the TryFunction answer false
                         // (text/text-methods/TextAssign.Codeunit.al:240-281, LT_BU_TextAssign_LongTextToCode20Parameter). A Decimal or
@@ -590,9 +658,6 @@ impl Lowerer<'_> {
                     .by_id(&id)
                     .ok_or_else(|| format!("{id} not in catalog"))?
                     .clone();
-                // Evaluate into an Option variable: a variable has no OptionCaption, so a text that is neither an ordinal nor a
-                // member name is a plain rejection (P86Eval.al:Eval Option, `Bet`, `-1`, `1,0`). A field may name a member by its
-                // caption, which the value does not carry, so a field keeps the id that refuses it.
                 if id == "System.Format#1" || id == "System.Format#2" {
                     if let Some(why) = args.first().and_then(|a| self.decimal_field_format_unpinned(a)) {
                         return Ok(ir::Expr::Refused(why));
@@ -630,31 +695,17 @@ impl Lowerer<'_> {
                 } else {
                     None
                 };
-                let emit_id = if option_captions.is_some() {
-                    "System.EvaluateOptionField#1".to_string()
-                } else if id == "System.Evaluate#1"
-                    && args.first().is_some_and(|a| {
-                        // An element of an Option array variable reads as the variable does: an unknown name answers false
-                        // and keeps the element (types/arrays/PnC14OptionArray.al:51-78,
-                        // OptionArray_Evaluate_And_Out_Of_Range).
-                        let var = if a.kind() == SyntaxKind::IndexExpr {
-                            a.children().next()
-                        } else {
-                            Some(a.clone())
-                        };
-                        matches!(self.ty_of(a), Ty::Option(_))
-                            && var.is_some_and(|v| matches!(self.res(&v), Some(Res::Local(_) | Res::Global(_))))
-                    })
-                {
-                    "System.EvaluateVariableOption#1".to_string()
-                } else if id == "System.Evaluate#1"
-                    && args
-                        .first()
-                        .is_some_and(|a| matches!(self.ty_of(a), Ty::Text(Some(_)) | Ty::Code(Some(_))))
-                {
-                    "System.EvaluateBounded#1".to_string()
+                let emit_id = if id == "System.Evaluate#1" {
+                    self.evaluate_id(args.first(), option_captions.is_some()).to_string()
                 } else if id == "Dialog.Error#2" && args.first().is_some_and(|a| a.kind() != SyntaxKind::Literal) {
                     self.error_variant_id(args)
+                } else if id.starts_with("ErrorInfo.Create#")
+                    && args.len() == 1
+                    && matches!(self.error_text_form(&args[0]), al_builtins::native::ErrorTextForm::Literal)
+                {
+                    // The form of the message is what `GetLastErrorText(true)` after `FieldError(Field, ErrorInfo)` answers
+                    // by (errors/last-error/SnLastErrorTextMoreForms.al:130, :161).
+                    "ErrorInfo.CreateLiteral#1".to_string()
                 } else if matches!(id.as_str(), "Record.FieldError#1" | "Record.FieldError#2") && args.len() == 2 {
                     self.field_error_variant_id(&id, args)
                 } else if let Some(variant_id) = self.variant_argument_id(&id, args) {
@@ -688,16 +739,8 @@ impl Lowerer<'_> {
                     // `Blob.Length` compared with 0: only the sign of the stored size is observed (issue 6896; blob_length_sign.rs).
                     Self::blob_length_emit_id(&id, node)
                 };
-                // `IsNull` of a `[RunOnClient]` DotNet variable: the variable can never be assigned (its constructor and
-                // `Create` raise), so it is null (onprem-dotnet/lt-bg-runonclient/BgRunOnClient.al:171-176, :211-223
-                // `ok Yes`; the second pin is on corpus master from PR 790).
-                // `Clear` of a `[RunOnClient]` variable: it stays null (corpus master 92fdde19,
-                // onprem-dotnet/lt-bg-runonclient/BgRunOnClient.al:454-480 Y16_RunOnClient_ClearAndVariant `cleared isnull=Yes`).
-                if (id == "System.IsNull#1" || id == "System.Clear#1")
-                    && args.len() == 1
-                    && self.run_on_client_var(&args[0]).is_some()
-                {
-                    return Ok(ir::Expr::Const(ir::Const::Boolean(true)));
+                if let Some(e) = self.is_null_or_clear(&id, args)? {
+                    return Ok(e);
                 }
                 let receiver = match &receiver_node {
                     // `CurrReport` is the report whose code is running: the VM takes the running
@@ -1204,6 +1247,20 @@ impl Lowerer<'_> {
             self.assume(al_builtins::assumptions::Assumption::EnumOverloadOwnType);
         }
         self.twin_call_refusal(object, offset)
+    }
+
+    /// `IsNull` or `Clear` of one argument that `call` lowers apart, or `None`.
+    /// - `IsNull` of a `[RunOnClient]` DotNet variable: the variable can never be assigned (its constructor and `Create`
+    ///   raise), so it is null (onprem-dotnet/lt-bg-runonclient/BgRunOnClient.al:171-176, :211-223 `ok Yes`; the second pin is
+    ///   on corpus master from PR 790).
+    /// - `Clear` of a `[RunOnClient]` variable: it stays null (corpus master 92fdde19,
+    ///   onprem-dotnet/lt-bg-runonclient/BgRunOnClient.al:454-480 Y16_RunOnClient_ClearAndVariant `cleared isnull=Yes`).
+    fn is_null_or_clear(&self, id: &str, args: &[SyntaxNode]) -> L<Option<ir::Expr>> {
+        let [a] = args else {
+            return Ok(None);
+        };
+        let shortcut = (id == "System.IsNull#1" || id == "System.Clear#1") && self.run_on_client_var(a).is_some();
+        Ok(shortcut.then_some(ir::Expr::Const(ir::Const::Boolean(true))))
     }
 
     /// The checker's runtime refusal of this call, if any: AL0666 (a builtin newer than the app's runtime) or AR1007
