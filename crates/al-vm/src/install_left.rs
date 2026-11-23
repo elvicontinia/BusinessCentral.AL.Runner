@@ -251,6 +251,8 @@ impl Session {
             global_language: _,
             caption_translations: _,
             ui_caption_translated: _,
+            // Empty at rest (`at_rest`).
+            field_captions_running: _,
             get_load: _,
             sysid_load: _,
             find_load: _,
@@ -288,6 +290,7 @@ impl Session {
         self.depth == 0
             && self.frames.is_empty()
             && self.call_stack.is_empty()
+            && self.field_captions_running.is_empty()
             && self.xp_pass_views.is_empty()
             && self.xp_unlinked_passes.is_empty()
             && self.xp_link_hidden.is_empty()

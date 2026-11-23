@@ -1644,7 +1644,7 @@ impl Session {
             "Name" if field.id == SYSTEM_ROW_VERSION_ID => Ok(Value::Text("timestamp".into())),
             "Name" => Ok(Value::Text(field.name.clone().into())),
             "Caption" => self
-                .field_caption_checked(&t, pos, Some(&rec))
+                .field_caption_checked(&t, pos, Some(&rec), false)
                 .map(|s| Value::Text(s.into())),
             "Type" => self.field_type(&t, pos),
             "Class" => {

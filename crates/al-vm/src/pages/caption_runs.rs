@@ -82,7 +82,7 @@ impl Session {
             Some(runs) => {
                 for _ in 0..runs {
                     for (pos, expr) in exprs {
-                        self.field_caption_class_value(t, *pos, Some(empty), expr)?;
+                        self.field_caption_class_value(t, *pos, Some(empty), expr, false)?;
                     }
                 }
             }
@@ -236,7 +236,7 @@ impl Session {
         self.with_caption_dialogs(CaptionDialogs::Refused, |this| {
             for _ in 0..pin.runs {
                 for (pos, expr) in exprs {
-                    this.field_caption_class_value(t, *pos, Some(empty), expr)?;
+                    this.field_caption_class_value(t, *pos, Some(empty), expr, false)?;
                 }
             }
             Ok(())
@@ -275,7 +275,7 @@ impl Session {
         self.with_caption_dialogs(CaptionDialogs::Refused, |this| {
             for _ in 0..20 {
                 for (pos, expr) in exprs {
-                    this.field_caption_class_value(t, *pos, Some(empty), expr)?;
+                    this.field_caption_class_value(t, *pos, Some(empty), expr, false)?;
                 }
             }
             Ok(())
@@ -362,7 +362,7 @@ impl Session {
                 let Some((pos, expr)) = exprs.iter().find(|(pos, _)| t.fields[*pos].id == field.id) else {
                     continue;
                 };
-                let class = self.field_caption_class_value(t, *pos, Some(&rec), expr)?;
+                let class = self.field_caption_class_value(t, *pos, Some(&rec), expr, false)?;
                 let (caption, own_area) = self.control_expression_caption(st, &t.fields[*pos].name, &class)?;
                 let mut s = st.borrow_mut();
                 s.field_captions.retain(|(i, ..)| *i != idx);

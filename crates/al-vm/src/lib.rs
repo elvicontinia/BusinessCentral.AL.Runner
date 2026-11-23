@@ -1210,6 +1210,9 @@ pub struct Session {
     pub(crate) caption_translations: Vec<(String, i32, String)>,
     /// The (class text, GlobalLanguage) pairs the `CaptionClassTranslate` statement raised the UI Helper event for.
     pub(crate) ui_caption_translated: Vec<(String, i32)>,
+    /// The fields whose `Record.FieldCaption` runs their CaptionClass expression now, as (table object, field position)
+    /// (`Session::record_field_caption`).
+    pub(crate) field_captions_running: Vec<(u32, usize)>,
     /// The row `load` is about to read came from `Get` (partial.rs: a `Get` of the row the buffer holds keeps what is loaded).
     pub(crate) get_load: bool,
     /// The row `load` is about to read came from `GetBySystemId` (al-runner issue 5913: a read in the transaction that wrote
@@ -1334,6 +1337,7 @@ impl Session {
             global_language: host.identity.global_language(),
             caption_translations: Vec::new(),
             ui_caption_translated: Vec::new(),
+            field_captions_running: Vec::new(),
             get_load: false,
             sysid_load: false,
             find_load: false,
