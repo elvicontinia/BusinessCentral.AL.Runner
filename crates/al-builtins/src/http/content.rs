@@ -78,6 +78,11 @@ pub(super) fn read_as_secret(c: &mut dyn Ctx, r: Option<&mut Value>, a: &mut [Va
             crate::assumptions::assume(crate::assumptions::Assumption::HttpReadasSecretStatement);
         }
     }
+    if data.starts_with(&UTF8_BOM) {
+        return unsupported(
+            "HttpContent.ReadAs(SecretText) of a body that starts with a byte order mark (not measured)",
+        );
+    }
     let Ok(t) = String::from_utf8(data) else {
         return unsupported("HttpContent.ReadAs(SecretText) of a body that is not UTF-8 (not pinned)");
     };
@@ -183,9 +188,14 @@ pub(super) fn read_as(c: &mut dyn Ctx, r: Option<&mut Value>, a: &mut [Value]) -
     // whatever its name says: iso-8859-1 reads each byte as a character, utf-16 reads little-endian units, a lone last byte is U+FFFD;
     // no charset, or another type, is UTF-8). A charset not measured stays refused.
     let decoded = match charset.as_deref() {
-        None | Some("utf-8") => String::from_utf8_lossy(&data).into_owned(),
+        None | Some("utf-8") => String::from_utf8_lossy(without_utf8_bom(&data)).into_owned(),
         Some("iso-8859-1" | "latin1") => data.iter().map(|b| char::from(*b)).collect(),
         Some("utf-16" | "utf-16le") => {
+            if data.starts_with(&[0xFF, 0xFE]) || data.starts_with(&[0xFE, 0xFF]) {
+                return unsupported(
+                    "HttpContent.ReadAs(Text) with the charset utf-16 of a body that starts with a byte order mark: not measured",
+                );
+            }
             let mut units: Vec<u16> = data.chunks_exact(2).map(|c| u16::from_le_bytes([c[0], c[1]])).collect();
             let mut text = String::from_utf16_lossy(&units);
             if data.len() % 2 == 1 {
@@ -202,6 +212,20 @@ pub(super) fn read_as(c: &mut dyn Ctx, r: Option<&mut Value>, a: &mut [Value]) -
     };
     a[0] = Value::Text(decoded.into());
     Ok(Value::Boolean(true))
+}
+
+const UTF8_BOM: [u8; 3] = [0xEF, 0xBB, 0xBF];
+
+/// The body without one UTF-8 byte order mark at its start, as BC reads it with a UTF-8 charset or none; a second mark
+/// right after it stays (assumption `http-readas-text-strips-byte-order-mark`, measured on BC 29).
+fn without_utf8_bom(data: &[u8]) -> &[u8] {
+    match data.strip_prefix(&UTF8_BOM) {
+        Some(rest) => {
+            crate::assumptions::assume(crate::assumptions::Assumption::HttpReadasTextStripsByteOrderMark);
+            rest
+        }
+        None => data,
+    }
 }
 
 /// `ReadAs(var InStream)` hands the body out once: a second read gets an empty stream
