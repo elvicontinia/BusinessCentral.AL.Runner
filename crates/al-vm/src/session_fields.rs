@@ -240,6 +240,7 @@ macro_rules! session_fields {
                 depth => |s: &Session| s.depth == 0,
                 xp_pass_views => |s: &Session| s.xp_pass_views.is_empty(),
                 frames => |s: &Session| s.frames.is_empty(),
+                field_captions_running => |s: &Session| s.field_captions_running.is_empty(),
                 // Set and cleared around one interface call (`run_iface`): false whenever no call runs.
                 next_interface_call => |s: &Session| !s.next_interface_call,
                 xp_unlinked_passes => |s: &Session| s.xp_unlinked_passes.is_empty(),

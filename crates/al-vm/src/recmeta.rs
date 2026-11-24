@@ -237,13 +237,39 @@ impl Session {
         Ok(parts.join("\t"))
     }
 
+    /// `Record.FieldCaption`. Inside a `Record.FieldCaption` of the same field, from its CaptionClass expression or one that
+    /// expression reaches, BC does not run the expression again: the nested read gives the field's caption, its Caption or else
+    /// its name (assumption `field-caption-inside-own-caption-class`, probe cells T01-T06, T08, T12, T13, P03; al-runner issue
+    /// 8329). A language other than the source's and an OnAfterCaptionClassResolve subscriber were not measured: refused.
+    pub(crate) fn record_field_caption(&mut self, t: &TableDef, pos: usize, rec: &Rec) -> Result<String, Signal> {
+        let key = (t.object, pos);
+        if !self.field_captions_running.contains(&key) {
+            self.field_captions_running.push(key);
+            let caption = self.field_caption_checked(t, pos, Some(rec), true);
+            self.field_captions_running.pop();
+            return caption;
+        }
+        let translated = self.field_caption_translation(t, pos);
+        if !matches!(translated, Ok(None)) || self.after_resolve_subscribed() {
+            return unsupported(format!(
+                "the caption of field {} read inside its own FieldCaption, translated or with an OnAfterCaptionClassResolve \
+                 subscriber (not measured, al-runner issue 8329)",
+                t.fields[pos].name
+            ));
+        }
+        al_builtins::assumptions::assume(al_builtins::assumptions::Assumption::FieldCaptionInsideOwnCaptionClass);
+        Ok(self.field_caption(t, pos))
+    }
+
     /// `FieldCaption` / `FieldRef.Caption`: refused for a system field whose caption the corpus does not pin. `rec` is the
-    /// record whose caption is read; without one (a query column) a CaptionClass expression is refused.
+    /// record whose caption is read; without one (a query column) a CaptionClass expression is refused. `field_caption`: the
+    /// read is a `Record.FieldCaption` (`record_field_caption`), which may run an expression that is already running.
     pub(crate) fn field_caption_checked(
         &mut self,
         t: &TableDef,
         pos: usize,
         rec: Option<&Rc<RefCell<RecordState>>>,
+        field_caption: bool,
     ) -> Result<String, Signal> {
         let written = self.field_caption_written(t, pos)?;
         // With an OnAfterCaptionClassResolve subscriber an area 3 CaptionClass is translated as well, which raises the event
@@ -276,7 +302,7 @@ impl Session {
             // result goes through the same resolvers as a literal (:262-296 Expressions_FieldCaption, :376-418
             // Expressions_FieldRefCaption).
             WrittenCaption::Expr(expr) => {
-                let class = self.field_caption_class_value(t, pos, rec, &expr)?;
+                let class = self.field_caption_class_value(t, pos, rec, &expr, field_caption)?;
                 match expression_class(&class) {
                     ExprCaption::FieldCaption => Ok(self.field_caption(t, pos)),
                     ExprCaption::Text(c) => self.expression_text_caption(&class, c),
@@ -349,12 +375,14 @@ impl Session {
     }
 
     /// The text field `pos`'s CaptionClass expression `expr` gives, run with `rec` as Rec (see `field_caption_checked`).
+    /// `field_caption`: the read is a `Record.FieldCaption`.
     pub(crate) fn field_caption_class_value(
         &mut self,
         t: &TableDef,
         pos: usize,
         rec: Option<&Rc<RefCell<RecordState>>>,
         expr: &str,
+        field_caption: bool,
     ) -> Result<String, Signal> {
         let routine = self.engine.program.objects[t.object as usize]
             .table
@@ -368,16 +396,21 @@ impl Session {
                 expr.trim()
             ));
         };
-        // A read of the field's caption while its own expression runs, from that expression or from one it calls: what BC's
-        // nested read gives is not pinned (al-runner issue 8329: the reporter's `'3,' + FieldCaption(<same field>)` passes on
-        // BC 29.1 with the field's caption), so it refuses instead of running the expression again.
+        // A read of the field's caption while its own expression runs, from that expression or from one it calls. A
+        // `Record.FieldCaption` runs it once more: the read that started it was a page control's caption or a FieldRef.Caption,
+        // which set no guard, and this one does (`record_field_caption`; assumption `field-caption-inside-own-caption-class`,
+        // probe cells T07, T15, P01, P04). Any other nested read recurses on BC until it runs out of memory (probe cell T14,
+        // a FieldRef.Caption inside its own expression) or is not measured: refused.
         let running =
             (self.frames.iter().zip(&self.call_stack)).any(|(&o, f)| !f.event && (o, f.routine) == (object, routine));
-        if running {
+        if running && !field_caption {
             return unsupported(format!(
                 "the caption of field {} read while its own CaptionClass expression runs (not pinned, al-runner issue 8329)",
                 t.fields[pos].name
             ));
+        }
+        if running {
+            al_builtins::assumptions::assume(al_builtins::assumptions::Assumption::FieldCaptionInsideOwnCaptionClass);
         }
         let class = self.call_on_record(object, routine, rec.clone(), None, Vec::new())?.0;
         Self::refuse_rendered_caption_class(&class)?;
@@ -588,7 +621,7 @@ impl Session {
             RecordOp::TableCaption => self.caption_checked(t).map(|c| Value::Text(c.into())),
             RecordOp::FieldName => Ok(Value::Text(t.fields[arg_pos(args, 0)?].name.clone().into())),
             RecordOp::FieldCaption => self
-                .field_caption_checked(t, arg_pos(args, 0)?, Some(rec))
+                .record_field_caption(t, arg_pos(args, 0)?, rec)
                 .map(|s| Value::Text(s.into())),
             RecordOp::FieldNo => Ok(Value::Integer(crate::refs::al_field_no(t.fields[arg_pos(args, 0)?].id))),
             // True for an enabled field (corpus record/TestRecordTriggers.al:223-231). What a field

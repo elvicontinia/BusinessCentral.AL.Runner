@@ -89,7 +89,7 @@ impl Session {
             Some(runs) => {
                 for _ in 0..runs {
                     for (pos, expr) in exprs {
-                        self.field_caption_class_value(t, *pos, Some(empty), expr)?;
+                        self.field_caption_class_value(t, *pos, Some(empty), expr, false)?;
                     }
                 }
             }
@@ -161,7 +161,7 @@ impl Session {
                 table: object.name.clone(),
             });
         let outer = std::mem::replace(&mut self.pages.caption_write_guard, guard);
-        let r = self.field_caption_class_value(t, pos, Some(rec), expr);
+        let r = self.field_caption_class_value(t, pos, Some(rec), expr, false);
         self.pages.caption_write_guard = outer;
         r
     }
@@ -285,7 +285,7 @@ impl Session {
         self.with_caption_dialogs(CaptionDialogs::Refused, |this| {
             for _ in 0..pin.runs {
                 for (pos, expr) in exprs {
-                    this.field_caption_class_value(t, *pos, Some(empty), expr)?;
+                    this.field_caption_class_value(t, *pos, Some(empty), expr, false)?;
                 }
             }
             Ok(())
@@ -463,7 +463,7 @@ impl Session {
                 let class = if write_checked {
                     self.field_caption_class_value_write_checked(t, *pos, &rec, expr)?
                 } else {
-                    self.field_caption_class_value(t, *pos, Some(&rec), expr)?
+                    self.field_caption_class_value(t, *pos, Some(&rec), expr, false)?
                 };
                 let (caption, own_area) = self.control_expression_caption(st, &t.fields[*pos].name, &class)?;
                 let mut s = st.borrow_mut();

@@ -273,6 +273,7 @@ impl Session {
             global_language: _,
             caption_translations: _,
             ui_caption_translated: _,
+            field_captions_running: _,
             get_load: _,
             sysid_load: _,
             find_load: _,
