@@ -13,6 +13,7 @@ mod http_content_get_headers;
 mod http_content_sharing;
 mod http_headers;
 mod http_network;
+mod http_read_as_bom;
 mod http_read_as_secret;
 mod http_request_cookies;
 mod instream_read_char;
