@@ -19,6 +19,8 @@
 //! is the one for Rename (the corpus answers 15, every bit; the bits 16 to 128 alone raise nothing); that the setup is asked once per table
 //! and session (AL Runner reads that in BC's `GetTriggersOnTable`); that `Insert(false)` and the
 //! other `RunTrigger = false` writes raise the database events too.
+//!
+//! Entry points: `global_setup`, `global_enabled`, `global_trigger`.
 
 use crate::Session;
 use crate::dispatch::EventCall;
@@ -72,7 +74,7 @@ impl Session {
             return Ok(*s);
         }
         let key = self.engine.events.global_key;
-        let id = self.engine.program.objects[table].id.unwrap_or(0) as i32;
+        let id = crate::object_ids::declared_id(self.engine.program.objects[table].id)? as i32;
         // A subscriber that writes the table it is asked about sees the table as not enabled.
         self.events.global_setups.insert(table, GlobalSetup::default());
         let mut setup = GlobalSetup::default();
@@ -268,7 +270,7 @@ impl Session {
                 names: &n,
                 sender: None,
             };
-            let table_id = self.engine.program.objects[t.object as usize].id.unwrap_or(0) as i32;
+            let table_id = crate::object_ids::declared_id(self.engine.program.objects[t.object as usize].id)? as i32;
             self.events.setup_no_ops = self.db_event_subscribers_changing_nothing(event, table_id);
             let raised = self.raise_global(&call, &mut args);
             self.events.setup_no_ops.clear();

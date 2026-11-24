@@ -5,6 +5,8 @@
 //! TestPageControlFieldDefaults.al, TestPageControlFieldControlTree.al,
 //! TestPageControlFieldPageExtension.al and pageextensioncontrol/
 //! TestPageExtensionControlPrecompiledRows_Tests.al.
+//!
+//! The page platform tables. Entry points: `source_table`.
 
 use super::mat::Entry;
 use super::objects::{Catalog, ident, member, prop, string_lit, truthy};
@@ -656,7 +658,11 @@ fn control_row(
     r[pos(t, 3)] = Value::Text(ctl.name.clone().into());
     // TableNo is the page's source table, stated even for a control with no source field
     // (TestPageControlFieldControlTree.al:59-61).
-    r[pos(t, 4)] = Value::Integer(src.and_then(|s| s.id).unwrap_or(0) as i32);
+    let table_no = match src {
+        Some(s) => s.id.ok_or_else(|| crate::object_ids::NO_DECLARED_ID.to_string())?,
+        None => 0,
+    };
+    r[pos(t, 4)] = Value::Integer(table_no as i32);
     // Enabled and Visible report a lower-case `true` when undeclared, Editable a capitalised `True`
     // (TestPageControlFieldDefaults.al:15-50).
     r[pos(t, 6)] = bool_prop(o, ctl, "enabled", "true")?;

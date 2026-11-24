@@ -4,6 +4,11 @@
 //!
 //! A RecordRef find goes through the Record's find; `recordref_record_op` marks it (`Session::find_through_recordref`), and the
 //! find takes the mark at its start (`FindVia::take`), so a find nested inside it is a Record's again.
+//!
+//! what `GetLastErrorText(true)` answers after a find on an empty set (DB:TableIsEmpty,
+//! DB:NothingInsideFilter, DB:RecordNotFound), for a Record and a RecordRef, each by its own measured
+//! cells; the RecordRef find is marked by `recordref_record_op`. Entry points: `recordref_record_op`,
+//! `table_is_empty_origin`, `nothing_inside_filter_origin`, `record_not_found_origin`.
 
 use super::*;
 use al_builtins::native::ErrorOrigin;
@@ -56,6 +61,18 @@ impl Session {
             op,
             RecordOp::Find | RecordOp::FindFirst | RecordOp::FindLast | RecordOp::FindSet
         );
+        if matches!(
+            op,
+            RecordOp::Find
+                | RecordOp::FindFirst
+                | RecordOp::FindLast
+                | RecordOp::FindSet
+                | RecordOp::Next
+                | RecordOp::Count
+                | RecordOp::IsEmpty
+        ) {
+            self.relation_field_no_recordref_scan(rec, op)?;
+        }
         let outer = std::mem::replace(&mut self.through_recordref, true);
         let r = self.record_op_of_al(op, rec, args);
         // A path that returned before the find took the mark leaves no mark behind.

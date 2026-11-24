@@ -1,6 +1,11 @@
 //! Resolves every name, member access and call in routine bodies, inferring
 //! expression types. The corpus compiles on BC, so a diagnostic here means
 //! the model is missing something, not that the AL is wrong.
+//!
+//! Resolves every name, member access and call in routine bodies, inferring types. Holds
+//! `CheckResult`, `Res`, `Roots`, the checker state and the entry points; `lean_left_out` (the
+//! workspace objects a lean compile of a selection leaves out, `Roots::lean`, `LEFT_OUT`). Entry
+//! points: `check_with`, `Checker`, `CheckResult`, `Res`, `Roots`.
 
 use crate::members::{MemberTable, ProcSig};
 use crate::types::Ty;
@@ -141,12 +146,20 @@ impl CheckResult {
         self.skipped.get(oi).copied().unwrap_or(false)
     }
 
-    /// The first diagnostic (in `diagnostics` order) at `offset` of the file at `path` whose code is one of `codes`:
-    /// what a scan of `diagnostics` finds, without the scan (lowering asks once per call it lowers).
-    pub fn diagnostic_at(&self, path: &str, offset: usize, codes: &[&str]) -> Option<&Diagnostic> {
+    /// The first diagnostic (in `diagnostics` order) at `offset` of the file at `path` of `app` whose code is one of
+    /// `codes`: what a scan of `diagnostics` finds, without the scan (lowering asks once per call it lowers).
+    pub fn diagnostic_at(&self, app: usize, path: &str, offset: usize, codes: &[&str]) -> Option<&Diagnostic> {
         self.diag_index
             .get_or_init(|| diag_index::DiagIndex::build(&self.diagnostics))
-            .find(&self.diagnostics, path, offset, codes)
+            .find(&self.diagnostics, app, path, offset, codes)
+    }
+
+    /// The checker's note that refuses the routine spanning `range` of the file at `path` of `app`
+    /// ([`diag_index::ROUTINE_REFUSALS`]), if one lies in it.
+    pub fn routine_refusal(&self, app: usize, path: &str, range: std::ops::Range<usize>) -> Option<&Diagnostic> {
+        self.diag_index
+            .get_or_init(|| diag_index::DiagIndex::build(&self.diagnostics))
+            .routine_refusal(&self.diagnostics, app, path, range)
     }
 
     /// Whether object `oi` was left out by a lean compile (`Roots::lean`).
@@ -220,13 +233,19 @@ pub enum Res {
         with: usize,
         inner: Box<Res>,
     },
+    /// `inner`, resolved on an unprobed assumption the lowering marks when it reads the name (`Rec.Field` whose type is the
+    /// field's enum where the file names the enum's name otherwise, `check/field_enum.rs`).
+    Assumed {
+        assumption: al_builtins::assumptions::Assumption,
+        inner: Box<Res>,
+    },
 }
 
 impl Res {
-    /// What the name resolved to, without the `with` statement that supplied it.
+    /// What the name resolved to, without the `with` statement that supplied it and the assumption it rests on.
     pub fn inner(&self) -> &Res {
         match self {
-            Res::With { inner, .. } => inner,
+            Res::With { inner, .. } | Res::Assumed { inner, .. } => inner.inner(),
             r => r,
         }
     }
@@ -235,6 +254,16 @@ impl Res {
     pub fn with_stmt(&self) -> Option<usize> {
         match self {
             Res::With { with, .. } => Some(*with),
+            Res::Assumed { inner, .. } => inner.with_stmt(),
+            _ => None,
+        }
+    }
+
+    /// The unprobed assumption the resolution rests on, if any.
+    pub fn assumption(&self) -> Option<al_builtins::assumptions::Assumption> {
+        match self {
+            Res::Assumed { assumption, .. } => Some(*assumption),
+            Res::With { inner, .. } => inner.assumption(),
             _ => None,
         }
     }
@@ -246,6 +275,8 @@ pub struct Roots {
     /// The install baseline: the install codeunits of the dependency apps and Base Application's
     /// `Company-Initialize` (codeunit 2).
     pub baseline: bool,
+    /// Company Triggers raised by dependency installs in selected backup companies (ADR-046 amendment 9).
+    pub company_install_events: bool,
     /// With `baseline`: dependency codeunits (by id) whose `OnRun` the install baseline runs after `Company-Initialize`
     /// to build the company's data (`--company-data demotool`: the DemoTool's `Create Demo Data from Config`). Empty: none.
     pub company_data: Vec<u32>,
@@ -509,7 +540,7 @@ fn check_inner(
             // `login.rs`, al-runner issue 7343).
             let login = (n_old..ws.objects.len())
                 .any(|oi| !ws.is_dependency(oi) && !skip(oi) && ws.declares_login_subscriber(oi));
-            c.reach_install_events(roots.baseline, install_code, login);
+            c.reach_install_events(roots.baseline, install_code || roots.company_install_events, login);
             c.reach_test_runner(&roots.test_runners);
             c.reach_dependencies_on_workspace();
             if !roots.no_login_root {
@@ -559,7 +590,7 @@ fn check_inner(
         left_out_resolutions = resolved;
         timings.workspace += started.elapsed();
     }
-    let positions: HashMap<&str, usize> = ws.files.iter().enumerate().map(|(i, f)| (f.path.as_str(), i)).collect();
+    let positions = ws.file_order();
     let from_checker = c.diags.clone();
     // A grown check: the rules of each object and of each app ran for the kept objects and apps; their findings are kept.
     let n_old_apps = if n_old > 0 { ws.objects[n_old - 1].app + 1 } else { 0 };
@@ -597,8 +628,7 @@ fn check_inner(
         kept_codes = all;
     }
     c.diags.extend(from_codes.iter().cloned());
-    c.diags
-        .sort_by_key(|d| (positions.get(d.file.as_str()).copied(), d.offset));
+    positions.sort(&mut c.diags);
     // Without a demand state (the eager compile) every dependency object is lowered, so every one
     // needs its layout.
     if narrate {
@@ -661,7 +691,7 @@ fn resolved_scope_findings(
     contexts: &[(usize, crate::alcodes::AppContext)],
     n_old_apps: usize,
     left_out_resolutions: Option<&PosMap<Res>>,
-    positions: &HashMap<&str, usize>,
+    positions: &crate::workspace::FileOrder<'_>,
 ) {
     if contexts.is_empty() {
         return;
@@ -675,14 +705,12 @@ fn resolved_scope_findings(
             more.extend(crate::alcodes::resolved_scope(ws, *app, ctx, r));
         }
     }
-    more.sort_by_key(|d| (d.file.clone(), d.offset, d.code));
-    more.dedup_by(|a, b| a.file == b.file && a.offset == b.offset && a.code == b.code);
+    more.sort_by(|a, b| a.site().cmp(&b.site()));
+    more.dedup_by(|a, b| a.site() == b.site());
     if !more.is_empty() {
         result.from_checker.extend(more.iter().cloned());
         result.diagnostics.extend(more);
-        result
-            .diagnostics
-            .sort_by_key(|d| (positions.get(d.file.as_str()).copied(), d.offset));
+        positions.sort(&mut result.diagnostics);
     }
 }
 
@@ -726,12 +754,8 @@ fn left_out_diagnostics(
             c.take_calls();
         }
     }
-    let seen: HashSet<(&str, usize, &str)> = found.iter().map(|d| (d.file.as_str(), d.offset, d.code)).collect();
-    let diags = c
-        .diags
-        .into_iter()
-        .filter(|d| !seen.contains(&(d.file.as_str(), d.offset, d.code)))
-        .collect();
+    let seen: HashSet<_> = found.iter().map(Diagnostic::site).collect();
+    let diags = c.diags.into_iter().filter(|d| !seen.contains(&d.site())).collect();
     (diags, Some(c.resolutions))
 }
 
@@ -1277,6 +1301,49 @@ pub(crate) fn one_char_literal(node: &SyntaxNode) -> bool {
         .is_some_and(|inner| inner.replace("''", "'").chars().count() == 1)
 }
 
+/// The `for` loops over a Char or an Integer variable whose bounds are one-character literals, the shapes language/ForCharBounds.al
+/// measured (open corpus PR 1525, assumption `for-char-literal-bounds`): a local Char loop variable with bounds (literal, literal)
+/// `to` and `downto`; with `to` only (literal, local Char variable), (local Char variable, literal) (Char_LiteralStart_CharVariableEnd,
+/// Char_CharVariableStart_LiteralEnd), (literal, 52)
+/// (Char_LiteralStart_IntegerEnd, `'0' to 52`) and (48, literal) (Char_IntegerStart_LiteralEnd, `48 to '4'`); a local Integer
+/// loop variable with (literal, literal). `kids` are the loop variable, the start and the end. Every other loop variable, bound
+/// kind, integer value, position and pair is not measured and keeps its refusal.
+pub(crate) fn for_one_char_literal_bounds(
+    kids: &[SyntaxNode],
+    down: bool,
+    ty: &dyn Fn(&SyntaxNode) -> Ty,
+    local_variable: &dyn Fn(&SyntaxNode) -> bool,
+) -> bool {
+    let [var, from, to, ..] = kids else {
+        return false;
+    };
+    if var.kind() != SyntaxKind::NameRef || !local_variable(var) {
+        return false;
+    }
+    // A literal is measured only inside the Basic Multilingual Plane (BC counts UTF-16 units; a non-BMP literal is a
+    // two-character text, AL0122).
+    let bmp_char =
+        |n: &SyntaxNode| one_char_literal(n) && literal_text(n).is_some_and(|t| t.chars().all(|c| c as u32 <= 0xFFFF));
+    let int_literal = |n: &SyntaxNode, value: &str| {
+        n.kind() == SyntaxKind::Literal
+            && matches!(literal_ty(n), Ty::Integer)
+            && literal_text(n).is_some_and(|t| t == value)
+    };
+    let (lit_from, lit_to) = (bmp_char(from), bmp_char(to));
+    let char_var = |n: &SyntaxNode| n.kind() == SyntaxKind::NameRef && matches!(ty(n), Ty::Char) && local_variable(n);
+    match ty(var) {
+        Ty::Char => {
+            (lit_from && lit_to)
+                || (!down && lit_from && char_var(to))
+                || (!down && char_var(from) && lit_to)
+                || (!down && lit_from && int_literal(to, "52"))
+                || (!down && int_literal(from, "48") && lit_to)
+        }
+        Ty::Integer => lit_from && lit_to,
+        _ => false,
+    }
+}
+
 /// `Ch + 'X'`, `'X' - Ch` and the like: a Char variable and a one-character literal under `+` or `-` ([`one_char_literal`];
 /// AfCharLiteralArithmetic.al:22-43). A character taken by index from a Text or Code variable counts too (`S[1] - '0'`,
 /// `'A' + C[1]`: format-evaluate/AtTextCharLiteral.al:15-112), and so does such a sum or difference followed by
@@ -1354,6 +1421,13 @@ fn member_name(node: &SyntaxNode) -> String {
         }
         _ => name_of(node),
     }
+}
+
+/// The source text of a literal's first token.
+fn literal_text(node: &SyntaxNode) -> Option<String> {
+    al_syntax::ast::significant_green_tokens(node)
+        .find(|t| !t.kind().is_trivia())
+        .map(|t| t.text().to_string())
 }
 
 fn literal_ty(node: &SyntaxNode) -> Ty {
@@ -1508,6 +1582,7 @@ pub(crate) use calls::BARE_REPORT_MEMBERS;
 mod conv;
 mod diag_index;
 mod enum_overload;
+mod field_enum;
 pub(crate) use enum_overload::EnumFit;
 pub(crate) use infer::in_request_page;
 mod fit;

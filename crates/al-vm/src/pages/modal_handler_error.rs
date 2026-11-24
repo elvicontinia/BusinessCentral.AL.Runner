@@ -1,5 +1,9 @@
 //! A modal page its ModalPageHandler left open by raising an error, and a modal close the page's OnQueryClosePage refused
 //! (moved out of `rows.rs`). Owns the close the platform still asks after the handler's error (`close_modal_after_handler_error`).
+//!
+//! A modal page its ModalPageHandler left open by raising an error, and a modal close its
+//! OnQueryClosePage refused (moved out of `rows.rs`). Entry points:
+//! `close_modal_after_handler_error`, `refuse_unpinned_modal_veto` (both by `answer_page`).
 
 use super::*;
 
@@ -96,7 +100,7 @@ impl Session {
         let engine = self.engine();
         let object = host.object as usize;
         if host.lookup
-            || host.run_static != Some(false)
+            || host.modal_run != ModalRun::Variable
             || host.tree_calls_unknown
             || engine.object_facts[object].page_type != Some(ir::PageType::Document)
         {

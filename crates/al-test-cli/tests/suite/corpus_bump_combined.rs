@@ -43,14 +43,50 @@ fn build_of(leg: &str) -> String {
     format!("{leg}.100.200")
 }
 
-/// The corpus: `c0` declares codeunits 50100, 50101 and 50103 (file D.al) and the OnPrem codeunit 60100; `c1` adds
-/// 50102 and deletes D.al; `c2` changes B.al (codeunit 50101); `side` is a commit off master.
+/// The corpus: `c0` declares codeunits 50100, 50101 and 50103 (file D.al) and the OnPrem codeunit 60100, and holds the
+/// stand-in select-tests.py (`SELECT_TESTS`); `c1` adds 50102 and deletes D.al; `c2` changes B.al (codeunit 50101);
+/// `side` is a commit off master.
 struct Corpus {
     dir: tempfile::TempDir,
     c0: String,
     c1: String,
     c2: String,
     side: String,
+}
+
+/// A stand-in for corpus select-tests.py --check-reuse (its own tests are in the corpus, test-select-tests.py): it
+/// appends its arguments as one JSON line to `reuse-calls.log` next to the corpus and answers what `reuse-answer.txt`
+/// there says (first line the exit code, then the output; no file: exit 0).
+const SELECT_TESTS: &str = r#"import json, os, sys
+a = sys.argv[1:]
+d = os.path.dirname(os.path.abspath(a[a.index("--repo") + 1]))
+open(os.path.join(d, "reuse-calls.log"), "a").write(json.dumps(a) + "\n")
+f = os.path.join(d, "reuse-answer.txt")
+code, _, text = (open(f).read() if os.path.exists(f) else "0\n").partition("\n")
+sys.stdout.write(text)
+sys.exit(int(code))
+"#;
+
+/// What the stand-in select-tests.py answers next (exit code and output).
+fn reuse_answer(c: &Corpus, code: i32, text: &str) {
+    std::fs::write(c.dir.path().join("reuse-answer.txt"), format!("{code}\n{text}")).unwrap();
+}
+
+/// The argument lists the stand-in select-tests.py was called with.
+fn reuse_calls(c: &Corpus) -> Vec<Vec<String>> {
+    std::fs::read_to_string(c.dir.path().join("reuse-calls.log"))
+        .unwrap_or_default()
+        .lines()
+        .map(|l| serde_json::from_str(l).unwrap())
+        .collect()
+}
+
+/// `c3` on master after `c2`: the corpus without select-tests.py (as before the reuse check existed).
+fn drop_select_tests(c: &Corpus) -> String {
+    let dir = c.dir.path().join("corpus");
+    git(&dir, &["rm", "-q", ".github/scripts/select-tests.py"]);
+    git(&dir, &["commit", "-qm", "c3"]);
+    git(&dir, &["rev-parse", "HEAD"])
 }
 
 fn put(corpus: &Path, rel: &str, text: &str) {
@@ -68,6 +104,7 @@ fn corpus() -> Corpus {
     put(&c, &format!("{APP}/B.al"), "codeunit 50101 \"B\"\n{\n}\n");
     put(&c, &format!("{APP}/D.al"), "codeunit 50103 \"D\"\n{\n}\n");
     put(&c, &format!("{ONPREM}/O.al"), "codeunit 60100 \"O\"\n{\n}\n");
+    put(&c, ".github/scripts/select-tests.py", SELECT_TESTS);
     git(&c, &["add", "."]);
     git(&c, &["commit", "-qm", "c0"]);
     let c0 = git(&c, &["rev-parse", "HEAD"]);
@@ -143,6 +180,8 @@ struct Spec {
     fetch: bool,
     /// A text replacement applied to every JUnit file of the run (from, to).
     patch: Option<(String, String)>,
+    /// `released_minors` of the current oracle.toml (ADR-078 point 3); None: the line is absent.
+    released: Option<Vec<&'static str>>,
 }
 
 /// A nightly run: id, commit, its comparison for every version it names (None: no manifest), status, conclusion,
@@ -240,6 +279,7 @@ impl Spec {
             rerun: false,
             fetch: false,
             patch: None,
+            released: None,
         }
     }
 
@@ -433,6 +473,9 @@ fn fixture(c: &Corpus, s: &Spec) -> (PathBuf, PathBuf, PathBuf) {
             build_of(leg)
         ));
     }
+    if let Some(r) = &s.released {
+        toml = format!("released_minors = {r:?}\n\n{toml}");
+    }
     std::fs::write(oracle.join("oracle.toml"), toml).unwrap();
     let dd = d.display();
     let gh = d.join("gh");
@@ -500,7 +543,8 @@ fn bump(c: &Corpus, s: &Spec) -> (i32, String) {
             .env("CORPUS_BUMP_CORPUS", &local)
             .env("CORPUS_BUMP_NO_FETCH", if s.fetch { "0" } else { "1" })
             .env("CORPUS_BUMP_PIN", &c.c0)
-            .env("CORPUS_BUMP_ORACLE", &oracle);
+            .env("CORPUS_BUMP_ORACLE", &oracle)
+            .env("CORPUS_BUMP_CLI", env!("CARGO_BIN_EXE_al-test-cli"));
         cmd
     })
 }
@@ -1593,4 +1637,281 @@ fn each_artifact_is_downloaded_once() {
     for z in &zips {
         assert!(seen.insert(*z), "downloaded twice: {z}\n{calls}");
     }
+}
+
+#[test]
+fn a_reused_codeunit_that_the_corpus_selection_selects_is_refused() {
+    let c = corpus();
+    reuse_answer(
+        &c,
+        1,
+        "refused: c0..c1: tests/al-language codeunit 50101 is selected (changed)\n",
+    );
+    refused(&c, &Spec::combined(&c), "tests/al-language codeunit 50101 is selected");
+}
+
+#[test]
+fn the_reuse_check_gets_every_reused_codeunit_by_source_commit_and_the_pin() {
+    let c = corpus();
+    accepted(&c, &Spec::combined(&c));
+    let calls = reuse_calls(&c);
+    assert_eq!(calls.len(), 1, "{calls:?}");
+    let a = &calls[0];
+    let arg = |k: &str| a[a.iter().position(|x| x == k).unwrap() + 1].clone();
+    assert_eq!(arg("--head"), c.c1);
+    let given: serde_json::Value = serde_json::from_str(&arg("--check-reuse")).unwrap();
+    assert_eq!(given, serde_json::json!({ &c.c0: { APP: "50101", ONPREM: "60100" } }));
+}
+
+#[test]
+fn a_pin_whose_select_tests_has_no_reuse_mode_is_refused() {
+    let c = corpus();
+    reuse_answer(
+        &c,
+        2,
+        "usage: select-tests.py [-h] [--base BASE]\nselect-tests.py: error: unrecognized arguments: --check-reuse\n",
+    );
+    refused(&c, &Spec::combined(&c), "unrecognized arguments: --check-reuse");
+}
+
+#[test]
+fn a_pin_without_select_tests_is_refused_when_results_are_reused() {
+    let c = corpus();
+    let c3 = drop_select_tests(&c);
+    let mut s = Spec::full(&c, &c3);
+    s.main[0].prov = prov(10, &c.c0, "27.5");
+    s.manifest = Some(manifest(20, 1, &c3, "subset", 1, 1));
+    s.nightlies.push(night(26, &c3, Some("identical")));
+    refused(&c, &s, "select-tests.py --check-reuse");
+}
+
+#[test]
+fn a_run_without_reused_results_does_not_ask_the_corpus_selection() {
+    let c = corpus();
+    let c3 = drop_select_tests(&c);
+    reuse_answer(&c, 1, "refused: anything\n");
+    accepted(&c, &Spec::full(&c, &c3));
+    assert!(reuse_calls(&c).is_empty());
+}
+
+/// ADR-078 point 3: the released minors of the list the corpus keeps, as a manifest records them.
+const RELEASED: [&str; 14] = [
+    "27.0", "27.1", "27.2", "27.3", "27.4", "27.5", "28.0", "28.1", "28.2", "28.3", "28.4", "28.5", "29.0", "29.1",
+];
+
+/// The symbols the corpus CI defines for a leg with the list `RELEASED` (the table of ADR-078 point 3).
+fn leg_symbols(leg: &str) -> Vec<String> {
+    let mut v: Vec<String> = vec!["BC27PLUS".into()];
+    if leg >= "28" {
+        v.push("BC28PLUS".into());
+    }
+    if leg >= "29" {
+        v.push("BC29PLUS".into());
+    }
+    let minors: &[&str] = match leg {
+        "27.5" => &["27"],
+        _ => &["27", "28"],
+    };
+    for n in minors {
+        v.extend((1..=5).map(|m| format!("BC{n}_{m}PLUS")));
+    }
+    v.sort();
+    v
+}
+
+/// A manifest that records the list and the symbols of each version.
+fn with_symbols(s: &mut Spec) {
+    let m = s.manifest.as_mut().unwrap();
+    m["released_minors"] = serde_json::json!(RELEASED);
+    for leg in LEGS {
+        m["versions"][leg]["preprocessor_symbols"] = serde_json::json!(leg_symbols(leg));
+    }
+}
+
+#[test]
+fn a_manifest_whose_symbols_match_the_runner_is_accepted_and_its_list_reported() {
+    let c = corpus();
+    let mut s = Spec::combined(&c);
+    with_symbols(&mut s);
+    let out = accepted(&c, &s);
+    assert!(
+        out.contains("preprocessor symbols of BC 27.5, 28.5, 29.0 agree with al-test-cli --print-symbols"),
+        "{out}"
+    );
+    assert!(out.contains("released minors: 27.0, 27.1"), "{out}");
+}
+
+#[test]
+fn a_manifest_whose_symbols_differ_from_the_runner_is_refused() {
+    let c = corpus();
+    let mut s = Spec::combined(&c);
+    with_symbols(&mut s);
+    s.manifest.as_mut().unwrap()["versions"]["29.0"]["preprocessor_symbols"] =
+        serde_json::json!(["BC27PLUS", "BC28PLUS", "BC29PLUS"]);
+    refused(
+        &c,
+        &s,
+        "BC 29.0: the results manifest names the preprocessor symbols BC27PLUS,BC28PLUS,BC29PLUS, \
+         al-test-cli --print-symbols 29.0 gives",
+    );
+}
+
+#[test]
+fn a_manifest_with_a_list_but_a_version_without_symbols_is_refused() {
+    let c = corpus();
+    let mut s = Spec::combined(&c);
+    with_symbols(&mut s);
+    s.manifest.as_mut().unwrap()["versions"]["28.5"]
+        .as_object_mut()
+        .unwrap()
+        .remove("preprocessor_symbols");
+    refused(
+        &c,
+        &s,
+        "BC 28.5: the results manifest records released minors but no preprocessor symbols",
+    );
+}
+
+#[test]
+fn a_manifest_with_symbols_but_no_list_is_refused() {
+    let c = corpus();
+    let mut s = Spec::combined(&c);
+    with_symbols(&mut s);
+    s.manifest
+        .as_mut()
+        .unwrap()
+        .as_object_mut()
+        .unwrap()
+        .remove("released_minors");
+    refused(&c, &s, "names preprocessor symbols but no released minors");
+}
+
+#[test]
+fn a_manifest_list_of_released_minors_that_is_no_list_of_versions_is_refused() {
+    let c = corpus();
+    for bad in [
+        serde_json::json!([]),
+        serde_json::json!("29.1"),
+        serde_json::json!([29.1]),
+    ] {
+        let mut s = Spec::combined(&c);
+        with_symbols(&mut s);
+        s.manifest.as_mut().unwrap()["released_minors"] = bad;
+        refused(&c, &s, "the results manifest's released minors");
+    }
+}
+
+#[test]
+fn manifest_symbols_that_are_no_list_of_names_are_refused() {
+    let c = corpus();
+    let mut s = Spec::combined(&c);
+    with_symbols(&mut s);
+    s.manifest.as_mut().unwrap()["versions"]["27.5"]["preprocessor_symbols"] = serde_json::json!("BC27PLUS");
+    refused(
+        &c,
+        &s,
+        "BC 27.5: the results manifest's preprocessor symbols 'BC27PLUS' are not a list of names",
+    );
+}
+
+/// al-test-cli refuses the list (an entry that is no `major.minor`), so the check refuses with its message.
+#[test]
+fn a_list_al_test_cli_refuses_is_refused() {
+    let c = corpus();
+    let mut s = Spec::combined(&c);
+    with_symbols(&mut s);
+    s.manifest.as_mut().unwrap()["released_minors"] = serde_json::json!(["27.0", "29"]);
+    refused(
+        &c,
+        &s,
+        "al-test-cli --print-symbols 27.5 --released-minors 27.0,29 failed: error: --released-minors",
+    );
+}
+
+/// The list in oracle.toml never goes away by a bump: a manifest without it (or a run without a manifest) is refused.
+#[test]
+fn a_manifest_without_a_list_is_refused_once_oracle_toml_records_one() {
+    let c = corpus();
+    let mut s = Spec::combined(&c);
+    s.released = Some(RELEASED.to_vec());
+    refused(
+        &c,
+        &s,
+        "oracle.toml records released minors, but the results manifest of run 20 has none",
+    );
+    let mut s = Spec::full(&c, &c.c1);
+    s.released = Some(RELEASED.to_vec());
+    s.manifest = None;
+    s.nightlies = vec![];
+    for x in s.main.iter_mut().chain(s.onprem.iter_mut()) {
+        x.prov = None;
+    }
+    refused(
+        &c,
+        &s,
+        "oracle.toml records released minors, but run 20 has no results manifest",
+    );
+}
+
+#[test]
+fn a_manifest_without_a_list_keeps_the_major_symbols_while_oracle_toml_records_none() {
+    let c = corpus();
+    let out = accepted(&c, &Spec::combined(&c));
+    assert!(
+        out.contains("no released minors recorded: the preprocessor symbols stay BC<major>PLUS"),
+        "{out}"
+    );
+}
+
+/// ADR-078 point 3: the edit writes the manifest's list of released minors as the top-level `released_minors` of
+/// oracle.toml (RELEASED_MINORS=FILE, a JSON list), replacing an older one; without the file the list stays.
+#[test]
+fn the_oracle_toml_gets_the_released_minors_of_the_manifest() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(dir.path().join("oracle")).unwrap();
+    for f in ["oracle.toml", "README.md"] {
+        std::fs::copy(root().join("oracle").join(f), dir.path().join("oracle").join(f)).unwrap();
+    }
+    let list = dir.path().join("released.json");
+    let edit = |released: Option<&[&str]>| {
+        let mut cmd = Command::new("python3");
+        if let Some(r) = released {
+            std::fs::write(&list, serde_json::json!(r).to_string()).unwrap();
+            cmd.env("RELEASED_MINORS", &list);
+        }
+        let o = cmd
+            .arg(root().join("tools/corpus_bump_edit.py"))
+            .arg(dir.path())
+            .arg("0123456789abcdef0123456789abcdef01234567")
+            .arg("999")
+            .output()
+            .unwrap();
+        assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+        let t = std::fs::read_to_string(dir.path().join("oracle/oracle.toml")).unwrap();
+        (toml::from_str::<toml::Value>(&t).unwrap(), t)
+    };
+    let released = |v: &toml::Value| -> Option<Vec<String>> {
+        v.get("released_minors").map(|l| {
+            l.as_array()
+                .unwrap()
+                .iter()
+                .map(|x| x.as_str().unwrap().to_string())
+                .collect()
+        })
+    };
+    let (v, _) = edit(Some(&RELEASED[..13]));
+    assert_eq!(
+        released(&v),
+        Some(RELEASED[..13].iter().map(|s| s.to_string()).collect())
+    );
+    let (v, t) = edit(Some(&RELEASED));
+    assert_eq!(released(&v), Some(RELEASED.iter().map(|s| s.to_string()).collect()));
+    assert_eq!(t.matches("released_minors = ").count(), 1, "{t}");
+    // It is a top-level key, not a field of the last table.
+    assert!(
+        t.find("released_minors = ").unwrap() < t.find("\n[[version]]").unwrap(),
+        "{t}"
+    );
+    let (v, _) = edit(None);
+    assert_eq!(released(&v), Some(RELEASED.iter().map(|s| s.to_string()).collect()));
 }

@@ -7,6 +7,10 @@
 //! routine by name and parameter-type signature, a field by table and field number). The object
 //! therefore does not depend on which other objects are in the program or in which order they
 //! come. Only link knows positions.
+//!
+//! The symbolic form of an object (ADR-033): the keys (`ObjKey`, `LocalKey`, `RoutineKey`,
+//! `FieldKey`, `ControlKey`), the per-object tables of references (`Refs`) and `SymObject`. Entry
+//! points: `ObjKey`, `Refs`, `SymObject`.
 
 use crate::{Object, SrcPos};
 use serde::{Deserialize, Serialize};
@@ -164,6 +168,7 @@ pub enum SubscriberTarget {
     CaptionClass,
     ReportingTriggers,
     FilterHelperTriggers,
+    UiHelperTriggers,
 }
 
 /// An event subscriber of an object that was not compiled (a dependency object nothing reached): the runtime

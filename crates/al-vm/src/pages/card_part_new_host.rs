@@ -7,6 +7,13 @@
 //! is not measured there: a part that declares it or has a subscriber of its event is refused. Pinned for a top-level Card or
 //! Document host; a hidden part on another host, or with a repeater, is refused as the new row opens
 //! (`refuse_unpinned_hidden_part_on_new_host`).
+//!
+//! A part without a repeater that shows no row of a new, unsaved host row runs OnAfterGetCurrRecord
+//! on the blank record (testpage/parts/HiddenPartOutsideChain.al, hidden or shown). A hidden part
+//! with a repeater or on another host is refused as a new row opens
+//! (`refuse_unpinned_hidden_part_on_new_host`). Entry points: `card_part_of_new_host`,
+//! `card_part_blank_on_new_host` (by `page_first_row_from`; also for the CardPart FactBox of a List
+//! host inside the steps of `list_factbox_new_line.rs`).
 
 use super::*;
 
@@ -63,7 +70,7 @@ impl Session {
 
     /// The blank record of such a part: Rec is blank, and its OnAfterGetCurrRecord and that event's subscribers run once
     /// (HiddenPartOutsideChain.al:320 `keyed` `fb-row()` after the key typed, a blank record again). The CardPart FactBox of a
-    /// List host takes it too inside the steps `list_factbox_new_line.rs` admits (assumption `list-factbox-new-line`).
+    /// List host takes it too inside the steps `list_factbox_new_line.rs` admits (pages/parts/ListHostFactBoxNewLine.al:162, :181).
     pub(super) fn card_part_blank_on_new_host(&mut self, st: &St) -> Result<(), Signal> {
         let object = st.borrow().object as usize;
         if self.declares_or_ext_declares(st, "onnewrecord")

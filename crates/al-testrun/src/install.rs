@@ -13,6 +13,20 @@
 //! per-database part runs last, with `CompanyName()` empty (`:138-140`). Inside one app and part the routines run in
 //! ascending codeunit id, across the 65536 id boundary (amendment 3, [`order_of`]); only the order of two subscribers of
 //! one codeunit is not pinned, and every test that can see it is refused (A2).
+//!
+//! The install code of each app (ADR-046 step A): install codeunit triggers and `Extension Triggers`
+//! subscribers per app and part (`plan`), the tables whose install rows tests may not read (`facts`:
+//! decision 4c, amendment 1 A2; `AL_INSTALL_FACTS=1` prints them), and the run of the apps under test
+//! one after the other (`run_apps_under_test`: install session id, SingleInstance reset, the app's
+//! own Company Triggers subscribers; under `--companies` the per-company part once per declared
+//! company, ADR-046 step B, and `refuse` for a routine that stops in another company; in the session
+//! company `skipped_at_home` splits its tables into `tables` and the `assumed` ones only the table-
+//! event subscribers of a table it only reads add). `not_ended_before_first_test` is the one reason
+//! text for code that runs as the test session opens the company (own and partner login subscribers,
+//! Company Triggers subscribers) and did not end: it names the event and, for a refusal, ends with
+//! `explain::site_suffix`; `runtime/run.rs` `observed_not_run` gives each test of the codeunit that
+//! stack under `--explain` (tests: `runtime/login_explain_tests.rs`). Entry points: `plan`, `facts`,
+//! `ensure_facts`, `run_apps_under_test`, `not_ended_before_first_test`.
 
 use al_builtins::describe::Describe;
 use al_builtins::native::Signal;
@@ -371,20 +385,16 @@ pub fn facts_of(lowered: &Lowered, events: &al_vm::events::Registry, dependency:
                     let written: BTreeSet<u32> = others.iter().flat_map(|c| c.written.iter().copied()).collect();
                     let singles: BTreeSet<usize> = others.iter().flat_map(|c| c.singles.iter().copied()).collect();
                     for &t in &written {
-                        out.assumed.entry(t as usize).or_insert((
-                            app.app,
-                            al_builtins::assumptions::Assumption::InstallCompanyTriggersAllApps,
-                        ));
+                        (out.assumed.entry(t as usize).or_default())
+                            .insert(al_builtins::assumptions::Assumption::InstallCompanyTriggersAllApps);
                     }
                     for c in &closures {
                         if c.read.intersection(&written).next().is_some()
                             || c.singles.intersection(&singles).next().is_some()
                         {
                             for &t in &c.written {
-                                out.assumed.entry(t as usize).or_insert((
-                                    app.app,
-                                    al_builtins::assumptions::Assumption::InstallCompanyTriggersAllApps,
-                                ));
+                                (out.assumed.entry(t as usize).or_default())
+                                    .insert(al_builtins::assumptions::Assumption::InstallCompanyTriggersAllApps);
                             }
                         }
                     }
@@ -426,7 +436,7 @@ pub fn facts_of(lowered: &Lowered, events: &al_vm::events::Registry, dependency:
                         let hit = |map: &mut InstallFacts, t: u32, why: String| match known {
                             Order::Pinned => {}
                             Order::Assumed(assumption) => {
-                                map.assumed.entry(t as usize).or_insert((app.app, assumption));
+                                map.assumed.entry(t as usize).or_default().insert(assumption);
                             }
                             Order::Unknown => {
                                 map.unknown.entry(t as usize).or_insert(why);
@@ -476,7 +486,8 @@ pub fn facts_of(lowered: &Lowered, events: &al_vm::events::Registry, dependency:
 /// tables the dependency apps' per-company install code writes (ADR-046 decision 4, "Not decided": not refused).
 pub(crate) fn ensure_facts<'a>(engine: &'a Engine, lowered: &Lowered) -> &'a InstallFacts {
     engine.install_facts.get_or_init(|| {
-        let f = facts(lowered, &engine.events);
+        let mut f = facts(lowered, &engine.events);
+        assume_by_id_install_tables(engine, lowered, &mut f);
         if std::env::var_os("AL_INSTALL_FACTS").is_some() {
             print_facts(lowered, &engine.events, &f);
         }
@@ -650,10 +661,10 @@ fn install_app_under_test(
             // A4 item 2: SingleInstance state starts again in each company and in the per-database part.
             session.reset_single_instances();
             session.set_company(&in_company);
-            // A4 item 4: Company Triggers in each company, before the routines. Under `--companies` the dependency
-            // apps stay in the session company (decision 5): in another company only the subscribers of the apps
-            // under test run (decided without owner review, 2026-10-29, ADR-046 amendment 2).
-            let with_dependencies = in_company == company;
+            // A4 item 4: Company Triggers in each company, before the routines. Dependency apps stay in the session
+            // company without backup data (decision 5); selected backup companies also run their subscribers
+            // (ADR-046 amendment 9).
+            let with_dependencies = in_company == company || engine.test_data.is_some();
             if let Some(why) = &unknown {
                 let subscribers = if part == Part::Company {
                     company_open_subscribers(lowered, &engine.events, |o| {
@@ -837,11 +848,38 @@ fn refused_tables(engine: &Engine, lowered: &Lowered, (oi, ri): (usize, usize), 
     if at_home {
         return touched(engine, lowered, oi, ri);
     }
-    let mut written = crate::baseline::tables_written_or_loaded(lowered, oi, ri);
+    with_subscribers(engine, lowered, (oi, ri), crate::baseline::tables_written_or_loaded)
+}
+
+/// The tables `of` finds for install code `(oi, ri)` and for each subscriber it reaches.
+fn with_subscribers(
+    engine: &Engine,
+    lowered: &Lowered,
+    (oi, ri): (usize, usize),
+    of: fn(&Lowered, usize, usize) -> BTreeSet<u32>,
+) -> BTreeSet<u32> {
+    let mut tables = of(lowered, oi, ri);
     for (so, sr) in crate::runtime::subscribers_reached(engine, lowered, oi, ri) {
-        written.extend(crate::baseline::tables_written_or_loaded(lowered, so, sr));
+        tables.extend(of(lowered, so, sr));
     }
-    written
+    tables
+}
+
+/// Assumption `subscriber-publisher-by-id` for install code: an Extension Triggers install subscriber of an app under test
+/// written with the bare id 2000000010 runs as the one that names the codeunit (corpus PR 1466, SbiSubscriberByIdTests.al:276;
+/// al-vm `Registry::is_by_id_install`; a dependency app's one refuses every test, `Registry::dependency_platform_by_id`). Its
+/// row changes exist only through it, so every table it and the subscribers it reaches insert into, modify, rename or delete
+/// from (`baseline::tables_changed_or_loaded`) marks a test that touches it (`InstallFacts::assumed`).
+fn assume_by_id_install_tables(engine: &Engine, lowered: &Lowered, out: &mut InstallFacts) {
+    for app in plan(lowered, &engine.events, false) {
+        let routines = app.company.iter().chain(&app.database);
+        for &(o, r) in routines.filter(|&&(o, r)| engine.events.is_by_id_install(o, r)) {
+            for t in with_subscribers(engine, lowered, (o, r), crate::baseline::tables_changed_or_loaded) {
+                let marks = out.assumed.entry(t as usize).or_default();
+                marks.insert(al_builtins::assumptions::Assumption::SubscriberPublisherById);
+            }
+        }
+    }
 }
 
 /// Whether install code that runs in `in_company` runs in the session company or in the per-database part (`""`).
@@ -938,15 +976,19 @@ impl InstallView {
         }
     }
 
-    /// (not installed, order unknown) while `installing` installs, with `fixed` an install order the runner chose for some apps of `group` with no dependency
-    /// path between them (ADR-046 amendment 7, `install_orders.rs`): between two apps of `fixed`, the one listed first is
-    /// installed while the other installs.
+    /// (not installed, order unknown) while `installing` installs, with `fixed` an install order the runner chose for some
+    /// apps of `group` with no dependency path between them (ADR-046 amendment 7, `install_orders.rs`) and `reads` the
+    /// edges "x's install reads from y's" the proof counted (`install_proof::Graph::reads`). An app of `fixed` listed
+    /// before `installing` is installed. One listed after it is not installed only when `reads` has the edge
+    /// (`installing`, it): then the proof also runs `installing` with it installed first. Every other one stays of
+    /// unknown order, so a meet with it is noted (ADR-079 decision 3, clarification of 2026-11-23, review round 2).
     pub(crate) fn of_ordered(
         &self,
         installing: u32,
         group: &BTreeSet<u32>,
         held: &BTreeSet<u32>,
         fixed: &[u32],
+        reads: &BTreeSet<(u32, u32)>,
     ) -> (BTreeSet<u32>, BTreeSet<u32>) {
         let mut not_installed = held.clone();
         let mut unknown = BTreeSet::new();
@@ -960,8 +1002,11 @@ impl InstallView {
             } else if let (Some(i), Some(j)) = (at(installing), at(g)) {
                 if j < i {
                     not_installed.remove(&g);
-                } else {
+                } else if reads.contains(&(installing, g)) {
                     not_installed.insert(g);
+                } else {
+                    not_installed.remove(&g);
+                    unknown.insert(g);
                 }
             } else if self.listed_order && g > installing {
                 not_installed.insert(g);
@@ -987,10 +1032,11 @@ impl InstallView {
 
     /// Sets what the session sees while `installing` installs.
     pub(crate) fn apply(&self, session: &mut Session, installing: u32, group: &BTreeSet<u32>, held: &BTreeSet<u32>) {
-        self.apply_ordered(session, installing, group, held, &[]);
+        self.apply_ordered(session, installing, group, held, &[], &BTreeSet::new());
     }
 
-    /// [`InstallView::apply`] with an install order chosen for the apps of `fixed` ([`InstallView::of_ordered`]).
+    /// [`InstallView::apply`] with an install order chosen for the apps of `fixed` and the edges `reads` the proof
+    /// counted ([`InstallView::of_ordered`]).
     pub(crate) fn apply_ordered(
         &self,
         session: &mut Session,
@@ -998,8 +1044,9 @@ impl InstallView {
         group: &BTreeSet<u32>,
         held: &BTreeSet<u32>,
         fixed: &[u32],
+        reads: &BTreeSet<(u32, u32)>,
     ) {
-        let (not_installed, unknown) = self.of_ordered(installing, group, held, fixed);
+        let (not_installed, unknown) = self.of_ordered(installing, group, held, fixed, reads);
         session.set_apps_not_installed(Some(not_installed));
         session.set_apps_install_order_unknown(Some(unknown));
         session.set_installing_app(Some(installing));
@@ -1055,7 +1102,7 @@ pub(crate) fn apps_under_test(lowered: &Lowered) -> BTreeSet<u32> {
 /// The subscribers of `Company Triggers` OnCompanyOpen, then OnCompanyOpenCompleted, that are not manual and whose object
 /// `keep` selects, each event in the order BC raises an event to its subscribers (ascending codeunit id: `al-vm`
 /// `dispatch.rs` `event_targets`).
-fn company_open_subscribers(
+pub(crate) fn company_open_subscribers(
     lowered: &Lowered,
     events: &al_vm::events::Registry,
     keep: impl Fn(usize) -> bool,
@@ -1084,10 +1131,10 @@ fn company_open_subscribers(
 /// probe Q3: the tables that relies on mark the tests that touch them (`facts`, `InstallFacts::assumed`). A subscriber of
 /// any app that cannot run here stops the app's per-company install routines, and what it and they touch is refused.
 ///
-/// `with_dependencies` false (a company other than the session company under `--companies`): the dependency apps' subscribers
-/// do not run there, since the dependency apps stay in the session company (ADR-046 decision 5, amendment 2). They run with
-/// the tables of `skipped` watched ([`watching_skipped`]).
-fn company_open(
+/// `with_dependencies` false (a company other than the session company under `--companies`): the dependency apps'
+/// subscribers do not run there without backup data (ADR-046 decision 5, amendment 2). Selected backup companies also
+/// run their subscribers (ADR-046 amendment 9). They run with the tables of `skipped` watched ([`watching_skipped`]).
+pub(crate) fn company_open(
     lowered: &Lowered,
     session: &mut Session,
     skipped: &[al_vm::SkippedInstall],
@@ -1118,7 +1165,7 @@ fn company_open(
         });
     }
     let all = company_open_subscribers(lowered, &engine.events, |o| {
-        (lowered.dependency[o] || !not_installed.contains(&objs[o].app))
+        !not_installed.contains(&objs[o].app)
             && (with_dependencies || !lowered.dependency[o])
             && !unknown.contains(&objs[o].app)
     });
@@ -1154,6 +1201,8 @@ pub(crate) struct CompanyOpenWrites {
     pub own_login: BTreeSet<u32>,
     /// What the partner dependency apps' login subscribers left where the session ran them (`partner_login.rs`).
     pub partner_login: crate::partner_login::PartnerLogin,
+    /// The login was raised to every subscriber (`login::Login::Raise`): what it left is what `login_replay.rs` checks.
+    pub raised: bool,
 }
 
 impl CompanyOpenWrites {
@@ -1237,14 +1286,18 @@ impl CompanyOpenWrites {
 ///
 /// All of it runs with the tables of `skipped` watched (`runtime::skipped_install_tables`): code that reads or writes the
 /// rows of install code that did not run to its end refuses the codeunit (review of al-runner PR 8119, probes n15, n16).
+///
+/// `after_refusal`: the second open of a codeunit whose first one ended with [`NotOpened::retry_own_login`]
+/// (`login::decide`).
 pub(crate) fn test_session_company_open(
     lowered: &Lowered,
     session: &mut Session,
     disabled: bool,
     skipped: &[al_vm::SkippedInstall],
+    after_refusal: bool,
 ) -> Result<CompanyOpenWrites, NotOpened> {
     match crate::runtime::watching_skipped_installs(lowered, session, skipped, crate::runtime::Assumed::Marked, |s| {
-        let opened = open_test_session_company(lowered, s, disabled);
+        let opened = open_test_session_company(lowered, s, disabled, after_refusal);
         // The window the partner dependency apps' login subscribers opened (`partner_login::PartnerLogin::watch_after`)
         // closes on every exit.
         let end = s.store_mut().watch_window_end();
@@ -1267,6 +1320,7 @@ fn open_test_session_company(
     lowered: &Lowered,
     session: &mut Session,
     disabled: bool,
+    after_refusal: bool,
 ) -> Result<CompanyOpenWrites, NotOpened> {
     let engine = session.engine.clone();
     let objs = &lowered.program.objects;
@@ -1283,7 +1337,7 @@ fn open_test_session_company(
         None
     };
     let mut decision = session.test_object.map_or(crate::login::Login::None, |t| {
-        crate::login::decide(&engine, lowered, t, watched)
+        crate::login::decide(&engine, lowered, t, watched, after_refusal)
     });
     // Microsoft's code raises OnRegisterAssistedSetup only while the checklist is not set up (the pin measured a session
     // where it was not, LgnLoginChecklistTests.al:10, :139): when it is, Microsoft's code decides (review of al-runner
@@ -1292,20 +1346,25 @@ fn open_test_session_company(
         if events.iter().any(|e| e.event == "onregisterassistedsetup")
             && crate::login::checklist_set_up(lowered, session)
         {
-            decision = crate::login::Login::Raise;
+            decision = crate::login::Login::Raise { fallback: false };
         }
     }
-    let raise = matches!(decision, crate::login::Login::Raise);
+    let raise = matches!(decision, crate::login::Login::Raise { .. });
+    let fallback = matches!(decision, crate::login::Login::Raise { fallback: true });
     // Under `--no-client` which login events a web-service session raises is not measured (assumption `no-client-session`):
     // the raised login is refused, before any login code runs.
     if raise && watched == Some(crate::login::NO_CLIENT) {
         return Err(format!("the login: {}", crate::login::NO_CLIENT_RAISE).into());
     }
     let partner = crate::partner_login::subscribers(lowered, &engine.events, raise, watched);
-    let (own, watched): (&[crate::login::OwnEvent], _) = match &decision {
-        crate::login::Login::Own { events, watched } => (events, *watched),
+    let (own, watched, memo_alone): (&[crate::login::OwnEvent], _, _) = match &decision {
+        crate::login::Login::Own {
+            events,
+            watched,
+            memo_alone,
+        } => (events, *watched, *memo_alone),
         crate::login::Login::Refused(why) => return Err(why.clone().into()),
-        _ => (&[], None),
+        _ => (&[], None, false),
     };
     let steps = crate::partner_login::steps(lowered, &engine.events, own, &partner);
     // The subscribers to run, (object, routine); `None` for the login raised to the apps' own subscribers.
@@ -1326,26 +1385,25 @@ fn open_test_session_company(
         of_event.sort_by_key(|&(id, _)| id);
         subs.extend(of_event.into_iter().map(|(_, s)| s));
     }
+    wrote.raised = raise;
     let mut own_wrote = BTreeSet::new();
     for step in subs {
         let Some((o, r)) = step else {
-            (own_wrote, wrote.partner_login) = own_login(lowered, session, &steps, watched)?;
+            (own_wrote, wrote.partner_login) = own_login(lowered, session, &steps, watched, memo_alone)?;
             continue;
         };
         let name = label(lowered, o, r);
         let who = format!("Company Triggers OnCompanyOpen(Completed) subscriber {name}");
         if let Some(reason) = crate::runtime::blocked_reason(lowered, o, r) {
-            return Err(NotOpened::refused_at_lowering(
-                format!("{who} before the first test: {reason}"),
-                o,
-                r,
-            ));
+            let not = NotOpened::refused_at_lowering(format!("{who} before the first test: {reason}"), o, r);
+            return Err(not.after_microsofts_login(lowered, fallback));
         }
         // The subscriber runs here, so what it wrote is what it wrote while it ran, not what its static reach could write:
         // code it did not run (a routine refused at lowering, a run by an id known only at run time, behind a branch that
         // is not taken) wrote nothing (al-runner issue 5641). Code it ran that is not supported raises `Unsupported`.
         let since = session.store_mut().change_counter();
-        call_before_first_test(lowered, session, &who, |s| s.call_parameterless_subscriber(o, r))?;
+        call_before_first_test(lowered, session, &who, |s| s.call_parameterless_subscriber(o, r))
+            .map_err(|not| not.after_microsofts_login(lowered, fallback))?;
         let store = session.store_mut();
         // A change to a computed (platform) table is not a stored row the watch can follow.
         if store.virtual_write_pending() {
@@ -1382,6 +1440,11 @@ pub(crate) struct NotOpened {
     pub why: String,
     pub site: Vec<al_vm::FaultFrame>,
     pub refused_in: Option<(usize, usize)>,
+    /// The runner refused (a refusal at lowering or `Signal::Unsupported`), not an AL error or another stop.
+    pub refusal: bool,
+    /// Microsoft's login code, raised with `login::Login::Raise { fallback: true }`, refused in Microsoft's code: the
+    /// codeunit runs again from a new session with the apps under test's own login (`runtime::run`).
+    pub retry_own_login: bool,
 }
 
 impl From<String> for NotOpened {
@@ -1397,7 +1460,18 @@ impl NotOpened {
             why,
             site: Vec::new(),
             refused_in: Some((o, r)),
+            refusal: true,
+            retry_own_login: false,
         }
+    }
+
+    /// Sets [`NotOpened::retry_own_login`] when `fallback` and the runner refused in a routine of a dependency app
+    /// published by Microsoft: the subscriber refused at lowering, else the innermost frame of the refusal's site.
+    fn after_microsofts_login(mut self, lowered: &Lowered, fallback: bool) -> Self {
+        let at = self.refused_in.map(|(o, _)| o).or(self.site.last().map(|f| f.object));
+        self.retry_own_login =
+            fallback && self.refusal && at.is_some_and(|o| crate::login_memo::microsoft_dependency(lowered, o));
+        self
     }
 }
 
@@ -1422,7 +1496,8 @@ pub(crate) fn call_before_first_test(
                     crate::explain::site_suffix(&lowered.program, &site)
                 ),
                 site,
-                refused_in: None,
+                refusal: true,
+                ..NotOpened::default()
             })
         }
         Err(Signal::Error(e)) => Err(NotOpened {
@@ -1431,7 +1506,7 @@ pub(crate) fn call_before_first_test(
                 e.message
             ),
             site: session.fault_site().to_vec(),
-            refused_in: None,
+            ..NotOpened::default()
         }),
         Err(_) => Err(format!("{who} stopped before the first test (not pinned)").into()),
     }
@@ -1448,6 +1523,7 @@ fn own_login(
     session: &mut Session,
     steps: &[crate::partner_login::Step],
     watched: Option<&'static str>,
+    memo_alone: bool,
 ) -> Result<(BTreeSet<u32>, crate::partner_login::PartnerLogin), NotOpened> {
     let before = watched.map(|_| session.state_stamp());
     let mut wrote = BTreeSet::new();
@@ -1472,7 +1548,10 @@ fn own_login(
             "{} raised to the login subscribers of the apps under test",
             lowered.program.objects[po].routines[pr].name
         );
+        let at = session.left_stamp();
         call_before_first_test(lowered, session, &what, |s| s.raise_to(po, pr, &step.subscribers))?;
+        let singles = at.changed(&session.left_stamp()).singles;
+        crate::partner_login::own_step(lowered, session, singles, &mut partner, memo_alone);
         // On BC the registration events are raised inside Base Application's "Checklist Events" subscriber of the
         // isolated OnAfterLogin, whose own transaction commits before the app's OnAfterLogin subscribers run; an isolated
         // event isolates a subscriber only when nothing is pending (codeunits/TestIsolatedEventSubscriberError.al:5-11,
@@ -1850,8 +1929,8 @@ fn replayable(
 }
 
 /// Install code that did not run to its end: why, and what `stopped_state::roll_back_stopped_install` needs.
-struct Stopped {
-    why: String,
+pub(crate) struct Stopped {
+    pub(crate) why: String,
     root: (usize, usize),
     /// The session language and WorkDate right before `root` ran.
     before: al_vm::CarriedState,
@@ -1872,7 +1951,7 @@ impl Stopped {
     /// end and kept them: those tables join `skipped` too, besides the ones the callers' [`refuse`] names from the static
     /// reach of the install code `refused`, which misses a table written through a RecordRef (review of al-runner PR
     /// 8119, probes n19, n19b and n19c). A table [`refuse`] names keeps that refusal's reason, as on main.
-    fn roll_back(
+    pub(crate) fn roll_back(
         &self,
         lowered: &Lowered,
         session: &mut Session,

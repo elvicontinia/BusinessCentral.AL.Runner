@@ -5,9 +5,15 @@
 //! grammar through the strings it feeds to `SetView`
 //! (`'SORTING(Entry No.) WHERE(Entry No.=FILTER(1..3))'`:
 //! recordref-fieldref/recordref/TestRecordRefFilter.al:23). Anything else is refused.
+//!
+//! Filter and view text: SetView, GetFilters, filter group text, AL property views (`property_view`),
+//! the one reader of a view's parts (`view_parts`, `view_clauses`: which of SORTING, ORDER, WHERE a
+//! view has). Entry points: `parse_filter_text`, `filter_text`, `get_filters`, `property_view`,
+//! `view_clauses`. `get_filters_order`: the order of a FlowField filter and a FlowFilter filter in
+//! GetFilters, RecordRef.GetFilters and a Find error text (the one shape
+//! record/filters/ByValueRecordView.al:575-582 pins; every shape outside it refuses).
 
 use crate::Session;
-use al_builtins::assumptions::{Assumption, assume};
 use al_builtins::describe::Describe;
 use al_builtins::filter::{FieldFilter, FilterExpr, needs_quotes};
 use al_builtins::native::{Signal, unsupported};
@@ -17,6 +23,10 @@ use std::cell::RefCell;
 use std::rc::Rc;
 
 type Rec = Rc<RefCell<RecordState>>;
+
+/// `filter::parse_filter_with` or `filter::parse_filter_both_at_signs_measured`.
+type ParseFilter =
+    fn(&str, &[Value], &RtType, &dyn Fn(u32) -> Result<Vec<(i32, String)>, String>) -> Result<FilterExpr, String>;
 
 /// `=` before a literal text that `filter_value_with` quotes for its `*` or `?` alone, so it does not read as a pattern.
 fn equal_sign(v: &Value) -> &'static str {
@@ -40,10 +50,29 @@ impl Session {
 
     /// A filter expression over a field of type `ty`, enum members by name included.
     pub(crate) fn parse_filter_text(&self, text: &str, ty: &al_builtins::value::RtType) -> Result<FilterExpr, String> {
+        self.parse_filter_text_by(al_builtins::filter::parse_filter_with, text, ty)
+    }
+
+    /// [`Self::parse_filter_text`] where the cells measure `@` alone and `<>@` alone on a Code field
+    /// (`filter::parse_filter_both_at_signs_measured`).
+    pub(crate) fn parse_filter_text_both_at_signs_measured(
+        &self,
+        text: &str,
+        ty: &al_builtins::value::RtType,
+    ) -> Result<FilterExpr, String> {
+        self.parse_filter_text_by(al_builtins::filter::parse_filter_both_at_signs_measured, text, ty)
+    }
+
+    fn parse_filter_text_by(
+        &self,
+        parse: ParseFilter,
+        text: &str,
+        ty: &al_builtins::value::RtType,
+    ) -> Result<FilterExpr, String> {
         let engine = self.engine.clone();
         let language = al_builtins::format::FormatCtx::language(self);
         let enums = |id: u32| crate::views::enum_filter_members(&engine.program.objects[id as usize], language);
-        al_builtins::filter::parse_filter_with(text, &[], ty, &enums)
+        parse(text, &[], ty, &enums)
     }
 
     /// `filter_value`; with `iso` a Date reads `yyyy-mm-dd`, as a view writes it (record/crud/RcAMisc.al:
@@ -194,14 +223,15 @@ impl Session {
                 return unsupported("the filter text of a DateTime with seconds and no milliseconds (not pinned)");
             }
         }
-        // A closing date under another language than English: Format marks it with the letter of the language (assumption
-        // `closing-date-letter-by-language`); what GetFilter, GetFilters and GetView show there is not measured.
+        // A closing date under another language than English: Format marks it with the letter of the language
+        // (localization/global-language/GlobalLanguageClosingDate.al:155, :264). GetFilter of it is pinned
+        // (record/filters/FilterGlobalLanguageDateBool.al:271, :325) but not answered here; GetFilters and GetView are not measured.
         if let Value::Date(_, true) = v
-            && self.global_language != 1033
+            && self.global_language() != 1033
         {
             return unsupported(format!(
-                "the filter text of a closing date under GlobalLanguage {} (not measured)",
-                self.global_language
+                "the filter text of a closing date under GlobalLanguage {} (not implemented)",
+                self.global_language()
             ));
         }
         let text = self.message_value(v)?;
@@ -263,10 +293,22 @@ impl Session {
             // `@''` reads back as written (corpus master record/crud/RcAFilters.al:1011, :1026 `at two apos`).
             FilterExpr::Like(p, true) if p.is_empty() => "@''".to_string(),
             FilterExpr::Like(p, ci) => format!("{}{p}", if *ci { "@" } else { "" }),
+            // A pattern with a blank at one end comes only from `placeholder_wildcard_edge` on a Text field (the parser refuses it
+            // elsewhere). Only `GetFilter` of the field reads it (`field_filter_text`); GetFilters, GetView and the like are not measured.
+            e if let Some(p) = e.edge_blank_not_like() => {
+                return unsupported(format!(
+                    "a read of the filter `<>%1` with the wildcard text `{p}` with a blank at one end other than GetFilter of the field (not measured)"
+                ));
+            }
             // record/filters/WildcardGetFilter.al:125-171: `<>*`, `<>A*`, `<>@a*` read back as written.
             FilterExpr::NotLike(p, ci) => format!("<>{}{p}", if *ci { "@" } else { "" }),
             // record/filters/WcInvalidFilterExpr.al:84-111: `@` and `<>@` read back as written.
             FilterExpr::AtSignAlone(negated) => if *negated { "<>@" } else { "@" }.to_string(),
+            // GetFilter, GetFilters and GetView write `@` and `<>@` alone on a Code field as written (AtSignAloneReads.al:823).
+            FilterExpr::AtSignAloneCode(negated) => {
+                al_builtins::assumptions::assume(al_builtins::assumptions::Assumption::AtSignAloneDatabaseBlank);
+                if *negated { "<>@" } else { "@" }.to_string()
+            }
             FilterExpr::EmptyViewValue => "==".to_string(),
             FilterExpr::UnpinnedMatch(inner, _) => self.filter_text_with(inner, iso)?,
             FilterExpr::UnpinnedText(_) => {
@@ -331,6 +373,11 @@ impl Session {
             .filter(|f| f.field == pos && f.group == r.filter_group)
             .map(|f| {
                 self.enum_ml_filter_check(&table, f)?;
+                // `<>'XYZ-* '`: corpus PR 1503 (open) record/filters/PlaceholderWildcardSuffix.al Text_NotEqualPlaceholder_StarSuffixValues;
+                // assumption `filter-placeholder-wildcard-edges`.
+                if let Some(p) = f.expr.edge_blank_not_like() {
+                    return Ok(format!("<>'{p}'"));
+                }
                 self.filter_text(&self.with_option_captions(&table, pos, &f.expr))
             })
             .collect::<Result<Vec<_>, _>>()?;
@@ -422,7 +469,7 @@ impl Session {
 
     /// The filters `get_filters` lists, in declaration order, except where a filter on a FlowField and a filter on a FlowFilter
     /// field form a pair: the FlowField comes first by declaration position or by field number. BC lists the FlowFilter first in
-    /// the one shape measured (assumption `get-filters-flowfilter-before-flowfield`, corpus PR 1430, ByValueRecordView.al:582):
+    /// the one shape pinned (record/filters/ByValueRecordView.al:575-576 with :582, :593-594 with :598):
     /// `Record.GetFilters`, filter group 0, no MarkedOnly, exactly those two filters, both fields declared by the table itself,
     /// the FlowField before the FlowFilter by position and by number alike, the FlowFilter's set first. Every other shape with
     /// such a pair refuses, also RecordRef.GetFilters and the filter list of a Find error: the order over field classes is not
@@ -460,10 +507,9 @@ impl Session {
             && set_at(&filters[1]) < set_at(&filters[0]);
         if !measured {
             return unsupported(
-                "GetFilters of a filter on a FlowField and a filter on a FlowFilter field, outside the one measured shape (the order over field classes is not measured, assumption get-filters-flowfilter-before-flowfield)",
+                "GetFilters of a filter on a FlowField and a filter on a FlowFilter field, outside the one pinned shape (ByValueRecordView.al:575-582; the order over field classes is not pinned)",
             );
         }
-        assume(Assumption::GetFiltersFlowfilterBeforeFlowfield);
         Ok(vec![filters[1].clone(), filters[0].clone()])
     }
 
@@ -763,7 +809,14 @@ impl Session {
                         let expr = match empty {
                             Some(e) => e,
                             None => {
-                                al_builtins::filter::with_date_context(date_ctx, || self.parse_filter_text(value, &ty))
+                                // `@` alone and `<>@` alone on a Code field are measured in a view SetView gets, not in an
+                                // object property.
+                                let parse = if runtime {
+                                    Self::parse_filter_text_both_at_signs_measured
+                                } else {
+                                    Self::parse_filter_text
+                                };
+                                al_builtins::filter::with_date_context(date_ctx, || parse(self, value, &ty))
                                     .map_err(|e| Signal::unsupported(format!("SetView: {e}")))?
                             }
                         };
@@ -942,6 +995,7 @@ fn ordinals(e: &FilterExpr) -> FilterExpr {
         FilterExpr::Like(p, ci) => FilterExpr::Like(p.clone(), *ci),
         FilterExpr::NotLike(p, ci) => FilterExpr::NotLike(p.clone(), *ci),
         FilterExpr::AtSignAlone(n) => FilterExpr::AtSignAlone(*n),
+        FilterExpr::AtSignAloneCode(n) => FilterExpr::AtSignAloneCode(*n),
         FilterExpr::EmptyViewValue => FilterExpr::EmptyViewValue,
         FilterExpr::UnpinnedMatch(..) | FilterExpr::UnpinnedText(_) => e.clone(),
         FilterExpr::NumCode(e) => FilterExpr::NumCode(e.clone()),

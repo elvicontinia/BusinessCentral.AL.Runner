@@ -1,4 +1,11 @@
 //! What a compile produces and keeps (`Compiled`), the warm slot (`Warm`), and what a run asks for.
+//!
+//! What a compile produces and keeps (`Compiled`, `into_apps` for another compile of the same run),
+//! the warm slot (`Warm`; the engines a request kept for the next one over the same compile,
+//! `KeptEngines`, issue 5856; the install baseline it read is kept per thread by
+//! `baseline_cache::read_kept`, and across an edit the install code cannot reach by
+//! `baseline_cache::carry`), and what a run asks for. Entry points: `RunOptions`, `Compiled`, `Warm`,
+//! `SuiteRun`.
 use super::*;
 
 /// How the `OnRun` trigger of a test codeunit shows in the results of a run: what Microsoft's test runner reports, which
@@ -87,6 +94,9 @@ pub struct RunOptions {
     /// The BC license of the run (ADR-060): the artifacts' license or `--license FILE`, parsed by the command line.
     /// `None`: no license; License Permission serves only the pinned rows.
     pub license: Option<std::sync::Arc<al_host::license::License>>,
+    /// The emit version of the run's build, which the missing-object error names (`crate::emit_version`). Default: none
+    /// known, and that error's text is not read.
+    pub emit_version: al_vm::emit_version::EmitVersion,
     /// Use the compile cache of the dependency apps (ADR-022). `None`: the demand-driven compile
     /// of every run, which is the reference path.
     pub compile_cache: Option<crate::compile_cache::CompileCache>,
@@ -189,6 +199,11 @@ pub struct RunOptions {
     /// `--skip-after-timeout` (al-runner issue 7517, opt-in, tooling): once a test is stopped at the time limit, the later tests
     /// of its codeunit are not run and end as not run, naming that test. Default `false`: a later pass is still reported.
     pub skip_after_timeout: bool,
+    /// `--stop-after-first-failure` and serve's `stopAfterFirstFailure` (al-runner issue 8210, opt-in, tooling): once a
+    /// test fails, the later tests of its codeunit and every later entry (`entries`) are not run and end as not run,
+    /// naming that test (`run::stopped_after_failure`). Each test codeunit stops on its own; every other test
+    /// codeunit of the same entry (or of a request without entries) still runs, also with one thread. Default `false`: every test runs.
+    pub stop_after_first_failure: bool,
     /// `al-runner test --permissions off` (ADR-062 section 5): no access kind is enforced, whatever stages are on by
     /// default. While no stage is on (today) it changes nothing.
     pub permissions_off: bool,
@@ -215,37 +230,18 @@ pub struct RunOptions {
     /// The run seed (ADR-061): each test method's `Random` seed and Guid key derive from it. The default is
     /// `al-test-cli`'s fixed seed 1.
     pub run_seed: crate::seed::RunSeed,
-    /// `al-runner test --strict-order` (ADR-066 amendment 12, decision 4): run the test codeunits in BC's order. The
-    /// single instances and the NumberSequence numbers carry from codeunit to codeunit (the carry chain and its walk,
-    /// amendments 8 and 11), and a codeunit that depends on SingleInstance state an earlier one left keeps
-    /// its parallel run (flagged) and runs again serially in BC's order when a test of it failed or was refused while
-    /// it ran there (amendments 4, 5 and 7; `max_replay` applies). Default `false` (amendment 12, decisions 1 to 3):
-    /// every test codeunit starts with fresh single instances and from the install baseline's sequence values, nothing
-    /// runs again, and a failed test that read state another codeunit would have set gets a hint
-    /// (`TestResult::order_hint`). Within one codeunit BC's order is always kept, and Disabled isolation still carries
-    /// its rows.
+    /// `al-runner test --strict-order` (ADR-070): one plain sequential run per BC session (`strict_walk.rs`). Each BC
+    /// session runs all its test codeunits one after the other on one thread in BC's order, the single instances, rows,
+    /// sequence values and storage moving along; BC sessions run in parallel with each other. Default `false` (ADR-070,
+    /// the isolated mode): every test codeunit starts with fresh single instances and from the install baseline's
+    /// sequence values, nothing runs again, and a failed test that read state another codeunit would have set gets a
+    /// hint (`TestResult::order_hint`). Within one codeunit BC's order is always kept, and Disabled isolation and OnRun
+    /// writers still carry their rows.
     pub strict_order: bool,
-    /// ADR-070, migration step 2 (internal, no front end flag; the test CLIs set it from `AL_STRICT_SEQUENTIAL`): with
-    /// `strict_order`, the plain sequential strict run instead of the carry chain and the lane. Each BC session
-    /// (`strict_walk.rs`) runs all its test codeunits one after the other on one thread in BC's order, the single
-    /// instances, rows, sequence values and storage moving along; BC sessions run in parallel with each other. Step 3
-    /// makes this what `--strict-order` does and removes the option.
-    pub strict_sequential: bool,
-    /// With `strict_order`: every dependent codeunit runs again serially in BC's order, not only one with a failure
-    /// (the meaning `--strict-order` had before ADR-066 amendment 12). Set by a stability run with the dimension
-    /// `isolation.singleInstance` for its base variant (ADR-058 amendment 1, decision 3); no front end flag.
-    pub replay_every_dependent: bool,
-    /// Stability mode with the dimension `isolation.singleInstance` (ADR-058 amendment 1, decision 2): each chain member
-    /// that read a carried SingleInstance value also runs once with fresh single instances, from the same database
-    /// start, and the lane keeps the parallel (fresh) run of each dependent codeunit it runs again
-    /// (`ChainReport::carried`). Outcomes of the run itself do not change.
+    /// Stability mode with the dimension `isolation.singleInstance` (ADR-058 amendment 1, decision 2): each codeunit
+    /// of a strict walk that read a carried SingleInstance value also runs once with fresh single instances, from the
+    /// same database start (`ChainReport::carried`). Outcomes of the run itself do not change.
     pub single_fresh_check: bool,
-    /// `al-runner test --max-replay N` (ADR-066 amendment 7, option 2, opt-in since the owner's change of 2026-11-08):
-    /// a serial re-run whose replay chain holds more than `N` test codeunits is skipped; the codeunit keeps its parallel
-    /// run, flagged (`Assumption::SingleInstanceRerunSkipped`). `None` (the default): no cap, every re-run the per-test
-    /// rule asks for is replayed in full. Only has an effect with `strict_order` (ADR-066 amendment 12, decision 4);
-    /// `replay_every_dependent` wins over it.
-    pub max_replay: Option<usize>,
     /// `al-runner test --test-suites FILE` (ADR-066 amendment 6, al-runner issue 6924): each suite is a BC session of
     /// its own for order dependence, the codeunits in the suite's order. No SingleInstance link, serial re-run or
     /// chain crosses a suite; a codeunit in no suite is a session of its own. `None`: the whole run is one session.
@@ -258,13 +254,10 @@ pub struct RunOptions {
     /// shared baseline, instead of sharing one frozen baseline. The reference side of the differential check
     /// (`AL_PRIVATE_BASELINE=1`, read by the front ends); not documented for users. Only time and memory depend on it.
     pub private_baseline: bool,
-}
-
-impl RunOptions {
-    /// ADR-070 step 2: the plain sequential strict run (`strict_order` with `strict_sequential`).
-    pub(crate) fn sequential_strict(&self) -> bool {
-        self.strict_order && self.strict_sequential
-    }
+    /// Compares what each test session holds after the raised login with the first session of the same inputs, and
+    /// reports it in `Phases::login_replay` (`login_replay.rs`, al-runner issue 8211; `ALRUNNER_LOGIN_REPLAY_CHECK=1`,
+    /// read by the front ends). Outcomes do not depend on it.
+    pub login_replay_check: bool,
 }
 
 /// One entry of a run (`RunOptions::entries`).
@@ -282,6 +275,10 @@ pub struct EntryRun {
     /// The time limit of this entry's tests (al-runner issue 8125): `None`: `RunOptions::test_time_limit`;
     /// `Some(None)`: no limit.
     pub test_time_limit: Option<Option<std::time::Duration>>,
+    /// With `RunOptions::stop_after_first_failure` (issue 8210), a failure stops only the later entries with the same
+    /// `stop_group`; `None` is one group, so with no group anywhere a failure stops every later entry (al-runner issue
+    /// 8210). The serve protocol refuses a mix of entries with and without a group.
+    pub stop_group: Option<String>,
 }
 
 /// One pass of `CorpusRuntime::run_compiled` (an entry, or the whole run), in program order.
@@ -292,6 +289,9 @@ pub(crate) struct Pass {
     pub(crate) resources: al_vm::ResourceOverrides,
     /// The time limit of the pass's tests (`RunOptions::test_time_limit`, or the entry's own).
     pub(crate) limit: Option<std::time::Duration>,
+    /// The scope of `RunOptions::stop_after_first_failure` for this pass (`pass_stopped` compares scopes by equality, so
+    /// the entries without a group share one); `None`: the stop is off.
+    pub(crate) stop: Option<super::run::StopAfterFailure>,
 }
 
 impl Pass {
@@ -315,8 +315,16 @@ impl Pass {
                 hooks: memory.hooks(&opts.hooks),
                 resources: Default::default(),
                 limit: opts.test_time_limit,
+                stop: opts
+                    .stop_after_first_failure
+                    .then_some(super::run::StopAfterFailure::Request),
             }];
         }
+        let stop = |e: &EntryRun| match &e.stop_group {
+            _ if !opts.stop_after_first_failure => None,
+            None => Some(super::run::StopAfterFailure::Request),
+            Some(g) => Some(super::run::StopAfterFailure::Group(Arc::from(g.as_str()))),
+        };
         let resources = |e: &EntryRun| {
             e.resources
                 .iter()
@@ -334,6 +342,7 @@ impl Pass {
                 hooks: memory.hooks(&e.hooks),
                 resources: resources(e),
                 limit: e.test_time_limit.unwrap_or(opts.test_time_limit),
+                stop: stop(e),
             })
             .collect()
     }
@@ -574,11 +583,12 @@ impl Compiled {
         }
         let t_replace = t_replace.elapsed();
         if declared {
-            // A declaration changed: the objects that name the changed ones may have read it, so they are
-            // checked and lowered again with them (ADR-033 step 5).
+            // A declaration changed: the objects that name or call the changed ones may have read it, so they are
+            // checked and lowered again with them (ADR-033 step 5). One with a call or member that did not resolve
+            // before is an error (`incremental::readers`): the caller compiles everything again.
             al_sema::incremental::eligible_for_declarations(ws, &dirty)?;
             let limit = ws.objects.len() / 5 + 20;
-            let readers = al_sema::incremental::readers(ws, &dirty, limit)?;
+            let readers = al_sema::incremental::readers(ws, lowered, &dirty, limit)?;
             dirty.extend(readers);
             dirty.sort_unstable();
         } else {

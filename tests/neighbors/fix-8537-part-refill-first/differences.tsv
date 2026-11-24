@@ -1,0 +1,4 @@
+# key	entry
+# Against main with PRs 8542 and 8700: the styled part cell of corpus PR 1534 (al-runner issue 8704) runs through the assumption.
+LT PR Tests::PartRefill_StyledPartActionThenFilterFirst_FindsRefilledRow	ASSUMED part-left-view-test-filter (corpus PR 1534, pages/parts/PartRefillTestFilter.al PartRefill_StyledPartActionThenFilterFirst_FindsRefilledRow)
+# StyledPart_OtherThreshold_First and StyledPart_StyleOnPeriodStart_First have no row: their bodies read as no cell, so main and the head both refuse them.

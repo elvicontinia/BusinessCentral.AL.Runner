@@ -24,15 +24,23 @@ pub(super) fn ui_as_new(ui: &UiState) -> bool {
 }
 
 /// What the TestPage client keeps between calls: install code opened no page whose state lasts.
-pub(super) fn pages_as_new(p: &PageClients) -> bool {
+pub(crate) fn pages_as_new(p: &PageClients) -> bool {
     let PageClients {
         action_tally,
         saved_values,
         saved_values_committed,
+        saved_rows,
+        saved_row_pending,
         traps,
         scope_unpinned,
         bg_worker,
+        bg_kept_last_error,
+        bg_task_error_unrecorded,
+        // Emptied when the session enters a test codeunit (`Session::reset_query_cache`), so what install code read is not
+        // carried.
+        query_cache: _,
         caption_dialogs,
+        caption_write_guard,
         bg_drain_after_call,
         page_xrec,
         modify_record_xrec,
@@ -55,14 +63,21 @@ pub(super) fn pages_as_new(p: &PageClients) -> bool {
         client_depth,
         code_close_vetoes,
         open_vetoed,
+        test_methods_started,
+        onvalidate_pages,
     } = p;
     action_tally.is_none()
         && saved_values.is_empty()
         && saved_values_committed.is_empty()
+        && saved_rows.is_empty()
+        && saved_row_pending.is_empty()
         && traps.is_empty()
         && scope_unpinned.is_empty()
         && bg_worker.is_none()
+        && bg_kept_last_error.borrow().is_none()
+        && !bg_task_error_unrecorded
         && *caption_dialogs == crate::pages::CaptionDialogs::default()
+        && caption_write_guard.is_none()
         && bg_drain_after_call.is_none()
         && page_xrec.is_none()
         && modify_record_xrec.is_empty()
@@ -85,6 +100,8 @@ pub(super) fn pages_as_new(p: &PageClients) -> bool {
         && *client_depth == 0
         && code_close_vetoes.is_empty()
         && open_vetoed.is_empty()
+        && *test_methods_started == 0
+        && onvalidate_pages.is_empty()
 }
 
 /// Event subscriptions, what the Event Subscription table reports and the install's own event state. Not checked:
@@ -104,6 +121,7 @@ pub(super) fn events_as_new(e: &EventState) -> bool {
         next_aliases,
         next_is_subscriber,
         by_value_publisher,
+        raise_arg_var_param,
         next_event_args,
         blob_publisher,
         next_blob_event,
@@ -153,6 +171,7 @@ pub(super) fn events_as_new(e: &EventState) -> bool {
         && next_aliases.is_empty()
         && !next_is_subscriber
         && by_value_publisher.is_none()
+        && !raise_arg_var_param
         && next_event_args.is_empty()
         && blob_publisher.is_none()
         && !next_blob_event
@@ -181,7 +200,7 @@ pub(super) fn events_as_new(e: &EventState) -> bool {
 /// Code coverage, the impact trace, the cell tap and the profiler: all off and nothing recorded. A run with one of them on
 /// keeps the install code in each codeunit's session (al-testrun `install_once.rs`); the cell tap is set from the session
 /// flags, so it fails here.
-pub(super) fn coverage_as_new(c: &CoverageState) -> bool {
+pub(crate) fn coverage_as_new(c: &CoverageState) -> bool {
     let CoverageState {
         code_coverage,
         coverage_counts,
@@ -190,6 +209,8 @@ pub(super) fn coverage_as_new(c: &CoverageState) -> bool {
         impact_on,
         cells,
         profiler,
+        install_footprint,
+        footprint_on,
     } = c;
     !code_coverage
         && coverage_counts.is_none()
@@ -198,10 +219,12 @@ pub(super) fn coverage_as_new(c: &CoverageState) -> bool {
         && !impact_on
         && cells.is_none()
         && profiler.is_none()
+        && install_footprint.borrow().is_none()
+        && !footprint_on
 }
 
 /// The report state: no report ran and nothing it noted lasts.
-pub(super) fn report_as_new(r: &ReportState) -> bool {
+pub(crate) fn report_as_new(r: &ReportState) -> bool {
     let ReportState {
         rebind_after_run,
         curr_report_language,
@@ -221,6 +244,7 @@ pub(super) fn report_as_new(r: &ReportState) -> bool {
         report_executed,
         execute_parameters,
         report_run_modal_done,
+        report_quit_deferred,
         excel_sheets,
         report_running,
         request_captions,
@@ -233,8 +257,11 @@ pub(super) fn report_as_new(r: &ReportState) -> bool {
         rp_init_by_handler,
         report_preview_pinned,
         run_modal,
+        run_bare,
         system_printer,
         set_view_filters,
+        // Read only while its run is the innermost running report, and a new run of the instance replaces it.
+        item_views: _,
         dataset,
     } = r;
     !rebind_after_run
@@ -255,6 +282,7 @@ pub(super) fn report_as_new(r: &ReportState) -> bool {
         && report_executed.is_empty()
         && execute_parameters.is_none()
         && report_run_modal_done.is_empty()
+        && report_quit_deferred.is_empty()
         && excel_sheets.is_idle()
         && report_running.is_empty()
         && request_captions.is_empty()
@@ -267,6 +295,7 @@ pub(super) fn report_as_new(r: &ReportState) -> bool {
         && rp_init_by_handler.is_empty()
         && report_preview_pinned.is_empty()
         && !run_modal
+        && !run_bare
         && !system_printer
         && set_view_filters.is_empty()
         && dataset.is_none()

@@ -5,6 +5,16 @@
 //! Only a save of a measured shape (`shape`) renders. Every other Html save keeps the opaque value of the amendment of
 //! 2026-11-12, Part A (`report_placeholder`), so no shape main answered changes. The Html written here carries no mark: it is
 //! plain text, every read answers (decision 3).
+//!
+//! the Html of a Word layout made by BC's own merger and converter through `DotNetConfig::renderer`.
+//! `mod.rs` the gate and the render (`Session::rendered_html`); `call.rs` the facts of the
+//! `Report.SaveAs` call (`SaveCall`, taken in `reports.rs` `report_save_as`); `shape.rs` the measured
+//! reports and datasets, each fact by equality (report properties and sections, the title, columns,
+//! rows, major and converter version), and the layout vocabulary (parts, relationships, element names
+//! per part, namespaces; the structure is free); `layout_facts.rs` reads the layout facts from the
+//! file. The save's whole fact vector after the run is compared in `report_save/html_cell.rs`. The
+//! content mark of the Word, Excel and Html placeholders, and what may still answer on them
+//! (presence, size, byte copies), is `al-builtins/src/placeholder_output.rs`.
 
 mod call;
 mod layout_facts;
@@ -15,7 +25,6 @@ pub(crate) use call::{RenderInputs, SaveCall};
 use crate::report_save::Renders;
 use crate::reports::Schema;
 use crate::{Session, Signal};
-use al_builtins::assumptions::{Assumption, assume};
 use al_host::render::{RenderNeed, WordMerge};
 
 /// The facts of the save itself, each by equality with every probe cell (RxHtmlHashTests.al:192, :218, :395, :433 and :471,
@@ -60,7 +69,6 @@ impl Session {
         if !shape::shape_is_measured(shape::SHAPES, &save) || translated {
             return Ok(None);
         }
-        let unpinned = shape::rests_on_unpinned_cells(shape::SHAPES, &facts, &save, &title);
         let renderer = self.engine.dotnet.renderer.clone();
         // A converter whose version no cell measured on this major gives Html that keeps Part A: do not render it.
         if let Some(version) = renderer.converter_version()
@@ -103,11 +111,8 @@ impl Session {
         if !major.is_some_and(|m| shape::build_is_measured(shape::BUILDS, m, &html)) {
             return Ok(None);
         }
-        // BC writes these bytes: RxHtmlHashTests.al:192, :218, :395, :433 and :471 assert their SHA-256 and length. A save
-        // with a fact only corpus pull request 1419 (merged, not pinned) measured rests on its assumption.
-        if unpinned {
-            assume(Assumption::ReportHtmlRenderedByBcConverter);
-        }
+        // BC writes these bytes: RxHtmlHashTests.al:192, :218, :395, :433 and :471 assert their SHA-256 and length, and
+        // RxHtmlWidenTests.al:394, :440, :482, :568 and :614 assert the Html's facts.
         Ok(Some(html))
     }
 }

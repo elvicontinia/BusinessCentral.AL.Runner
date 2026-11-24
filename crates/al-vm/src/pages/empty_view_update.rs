@@ -1,6 +1,10 @@
 //! A list page that shows no row before an action, and the `CurrPage.Update` after that action that fills it: the client
 //! reads the page as when it opens and the first row of the new view becomes current. `action_invoke_body` (actions.rs)
 //! asks `empty_list_view` before the action's trigger and `update_on_empty_list_view` after it.
+//!
+//! A list that shows no row before an action, and the `CurrPage.Update` after it that fills the page
+//! from the first row of the new view (view-mode lists, and the pinned edit-mode Worksheet). Entry
+//! points: `empty_list_view`, `update_on_empty_list_view` (from `action_invoke_body`).
 
 use super::pinned_shape::{NextEnd, PinnedEnd, Reads, capital_word, open_page_filters_then_find, own_table_code};
 use super::*;
@@ -47,9 +51,8 @@ impl Session {
         {
             let s = st.borrow();
             if !(s.open
-                && s.refresh
-                && s.refresh_by_update
-                && (s.refresh_update_false || s.empty_after_action)
+                && s.refresh.asked_by_update()
+                && (s.refresh.update_false() || s.empty_after_action)
                 && !s.dirty
                 && s.cursor == Cursor::None)
             {
@@ -60,7 +63,7 @@ impl Session {
         let mode = st.borrow().mode;
         match mode {
             PageMode::Edit => {
-                if !(n == 1 && st.borrow().refresh_update_false && self.empty_edit_worksheet_kept(st)?) {
+                if !(n == 1 && st.borrow().refresh.update_false() && self.empty_edit_worksheet_kept(st)?) {
                     return Ok(false);
                 }
             }
@@ -80,9 +83,7 @@ impl Session {
         }
         {
             let mut s = st.borrow_mut();
-            s.refresh = false;
-            s.refresh_by_update = false;
-            s.refresh_update_false = false;
+            s.refresh.cancel_update();
             s.empty_after_action = false;
         }
         self.page_first_row(st)?;

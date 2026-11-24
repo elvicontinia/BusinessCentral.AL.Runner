@@ -46,7 +46,13 @@ pub fn corpus() -> Workspace {
         root.join("al-language/app.json").exists(),
         "corpus submodule not checked out"
     );
-    Workspace::load(corpus_apps(&root), &al_version::corpus_symbols(27))
+    Workspace::load(
+        corpus_apps(&root),
+        &al_version::corpus_symbols(
+            &al_version::BcVersion::new(27, 0),
+            &al_version::ReleasedMinors::NotRecorded,
+        ),
+    )
 }
 
 /// `al-language` and the corpus apps it depends on (the internals fixture and the cross-app fixtures), dependencies
@@ -103,14 +109,6 @@ fn every_corpus_table_field_has_a_known_type() {
 /// Corpus files with model gaps that wait for a parser or resolver fix. Each is a red corpus test,
 /// not a pass. A file with no gap left fails the test below, so the list only shrinks (ADR-007).
 const KNOWN_GAP_FILES: &[(&str, &str)] = &[
-    (
-        "ReportDependencyC.ReportExt.al",
-        "the checker does not see a dataitem that a report extension of a dependency app adds (`AddedRow`, corpus bump to 2c02f723)",
-    ),
-    (
-        "ReportDependencyRisingC.ReportExt.al",
-        "the checker does not see a dataitem that a report extension of a dependency app adds (`AddedRow`, corpus bump to 2c02f723)",
-    ),
     (
         "pages/run-modal/Y47UnqualifiedRun.al",
         "the checker does not resolve a bare `Run()` with no arguments in a page (the page's own instance; corpus bump to 7f7cdc2a)",

@@ -5,6 +5,8 @@
 //! `FieldClass` is the C/AL order. The `FieldType` member names are the platform's; their
 //! ordinals are not pinned by the corpus (docs/probes-needed.md), so nothing here may be
 //! relied on to print as a number.
+//!
+//! Entry points: `members`, `option_members`.
 
 pub fn members(name: &str) -> Option<&'static [&'static str]> {
     match name.to_ascii_lowercase().as_str() {
@@ -137,7 +139,7 @@ pub fn members(name: &str) -> Option<&'static [&'static str]> {
         "executioncontext" => Some(&["Normal", "Install", "", "Upgrade"]),
         // Standard and Debug only (corpus must-not-compile 0010 to 0013 and 0019: Install, Uninstall, Upgrade,
         // Report and Profile do not exist). A test run formats as `Standard`
-        // (session-system/TestEnvironmentUserTenantContracts.al:247); the ordinals are not pinned.
+        // (session-system/TestEnvironmentUserTenantContracts.al:244); the ordinals are not pinned.
         "executionmode" => Some(&["Standard", "Debug"]),
         // Only `LocalScope` is named by the corpus; the ordinals are not pinned.
         "notificationscope" => Some(&["LocalScope", "GlobalScope"]),

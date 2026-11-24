@@ -1,11 +1,14 @@
 //! `Format(Value [, Length] [, FormatNumber])`. Every rule cites the corpus
 //! test or the doc table ("Formatting values, dates, and time") that pins it;
 //! where the two disagree the corpus wins (it runs on real BC).
+//!
+//! Entry points: `FormatCtx`, `FormatFail`, `try_format`, `format_value`.
 
 use crate::native::Signal;
 use crate::value::Value;
 use std::sync::Arc;
 
+pub(crate) mod length;
 mod recordid_number;
 mod region;
 pub use region::{Region, region_column};
@@ -204,7 +207,14 @@ fn format_in_region(
         }
         _ => return Err(refuse()),
     };
-    Ok(pad(text, length))
+    length::none_measured(
+        &format!(
+            "{} under CurrReport.FormatRegion",
+            crate::describe::Describe::describe(v)
+        ),
+        text,
+        length,
+    )
 }
 
 /// The text of a multi-language property (`ENU = 'a,b', DEU = 'x,y'`) in session language `language`: the entry of its
@@ -415,6 +425,11 @@ fn guid_text(g: &[u8; 16], standard: i32) -> Result<String, FormatFail> {
     })
 }
 
+/// The format region `CurrReport.FormatRegion` set, None where none is in force (an empty one included).
+pub(crate) fn region_in_force(ctx: &dyn FormatCtx) -> Option<String> {
+    ctx.region().filter(|r| !r.is_empty())
+}
+
 /// `Format(Value, Length, Standard)` with BC's own errors kept apart from refusals.
 pub fn format_value(v: &Value, length: i32, standard: i32, ctx: &dyn FormatCtx) -> Result<String, FormatFail> {
     if let Some(r) = format_unread(v, length, standard) {
@@ -432,7 +447,7 @@ pub fn format_value(v: &Value, length: i32, standard: i32, ctx: &dyn FormatCtx) 
             return Err(FormatFail::Unsupported(format!("Format of {} {why}", type_phrase(v))));
         }
     }
-    if let Some(region) = ctx.region().filter(|r| !r.is_empty()) {
+    if let Some(region) = region_in_force(ctx) {
         return format_in_region(v, length, standard, &region, ctx);
     }
     let s = match v {
@@ -772,7 +787,7 @@ pub fn format_value(v: &Value, length: i32, standard: i32, ctx: &dyn FormatCtx) 
     {
         return Ok(s.chars().take(length as usize).collect());
     }
-    Ok(pad(s, length))
+    length::rest(v, standard, s, length)
 }
 
 /// The value's type in a refusal text: a name, never the value's contents (a Record holds its
@@ -1349,8 +1364,8 @@ const MONTHS_ES_SHORT: [&str; 12] = [
     "ene", "feb", "mar", "abr", "may", "jun", "jul", "ago", "sept", "oct", "nov", "dic",
 ];
 
-/// Dutch month names of formats 4 and 7, the same in 1043 and 2067 (assumption month-names-dutch: MonthNamesLanguages.al
-/// Months_Dutch_Belgium_2067, Months_Dutch_1043).
+/// Dutch month names of formats 4 and 7, the same in 1043 and 2067 (format-evaluate/MonthNamesLanguages.al:71-96 for 2067,
+/// :108-133 for 1043).
 const MONTHS_NL: [&str; 12] = [
     "januari",
     "februari",
@@ -1370,9 +1385,9 @@ const MONTHS_NL_SHORT: [&str; 12] = [
 ];
 
 /// The letter of a closing date under GlobalLanguage `lang`: English `C` (types/date-time/Format.al:172-175); under 1030, 1031,
-/// 1036, 1044 and 1053 as measured (assumption `closing-date-letter-by-language`, corpus PR 1428
-/// GlobalLanguageClosingDate.al:123-284 at 04e1fa0a): `U` under 1030, 1031 and 1044, `S` under 1053, `C` under 1036. `None`
-/// for every other language.
+/// 1036, 1044 and 1053 (localization/global-language/GlobalLanguageClosingDate.al:155 for 1030, :264 for 1053, and the
+/// `Format` line of each test in :177-257): `U` under 1030, 1031 and 1044, `S` under 1053, `C` under 1036. `None` for
+/// every other language.
 fn language_closing_letter(lang: i32) -> Option<char> {
     match lang {
         1033 | 1036 => Some('C'),
@@ -1405,16 +1420,16 @@ pub(crate) fn closing_mark(standard: Option<i32>, lang: i32) -> Result<&'static 
             ));
         }
     };
-    crate::assumptions::assume(crate::assumptions::Assumption::ClosingDateLetterByLanguage);
+    // Standard format 0 under each language: GlobalLanguageClosingDate.al:155, :158 (1030), :264, :267 (1053) and the same
+    // lines of the 1031, 1036 and 1044 tests (:177-257).
     Ok(letter)
 }
 
 /// A closing-date text a reader takes under GlobalLanguage `lang` (1030, 1031, 1036, 1044 or 1053; `None` for English, whose
 /// reading is pinned, types/date-time/P143Date_FieldRef.al:89-113, and for every other language): the letter C, U or S as written
-/// in either case, followed by a date of two digits, `/`, two digits, `/` and two digits, the form the probe measured
-/// (assumption `closing-date-letter-by-language`, corpus PR 1428 at 04e1fa0a: GlobalLanguageClosingDate.al:90 for Evaluate,
-/// `C12/31/23`, `u12/31/23`, `U01/05/24` and more; FilterGlobalLanguageDateBool.al:117 and :125 for a Date filter, `C12/31/23`,
-/// `U12/31/23`, `S12/31/23`).
+/// in either case, followed by a date of two digits, `/`, two digits, `/` and two digits, the measured form
+/// (localization/global-language/GlobalLanguageClosingDate.al:90 for Evaluate, `C12/31/23`, `u12/31/23`, `U01/05/24` and
+/// more; record/filters/FilterGlobalLanguageDateBool.al:117 and :125 for a Date filter, `C12/31/23`, `U12/31/23`, `S12/31/23`).
 /// The answer: whether the letter is the language's own, the letter as written, and the date part. The caller checks its own
 /// measured facts and answers; no mark is set here.
 pub fn closing_letter_text(text: &str, lang: i32) -> Option<(bool, char, &str)> {
@@ -1466,13 +1481,9 @@ fn format_date(day: i32, closing: bool, standard: i32, lang: i32) -> Result<Stri
         // Danish months are not pinned. Dutch (1043, 2067) December of format 4 is pinned there too (EL_Date_NLD_1043, EL_Date_NLB_2067).
         (1030, 4) if m == 12 => "december",
         (1043 | 2067, 4) if m == 12 => MONTHS_NL[11],
-        // Every Dutch month of formats 4 and 7: measured by the corpus probe, not pinned yet (assumption month-names-dutch).
-        (1043 | 2067, 4) if crate::assumptions::hit(crate::assumptions::Assumption::MonthNamesDutch) => {
-            MONTHS_NL[m as usize - 1]
-        }
-        (1043 | 2067, 7) if crate::assumptions::hit(crate::assumptions::Assumption::MonthNamesDutch) => {
-            MONTHS_NL_SHORT[m as usize - 1]
-        }
+        // Every Dutch month of formats 4 and 7: format-evaluate/MonthNamesLanguages.al:71-96 (2067), :108-133 (1043).
+        (1043 | 2067, 4) => MONTHS_NL[m as usize - 1],
+        (1043 | 2067, 7) => MONTHS_NL_SHORT[m as usize - 1],
         (_, 4 | 7) => {
             return Err(FormatFail::Unsupported(format!(
                 "Format {standard} of a Date in language {lang}, month {m}: the month name is not pinned (docs/probes-needed.md)"
@@ -1541,7 +1552,7 @@ mod tests {
 
     #[test]
     fn dutch_month_names_of_formats_4_and_7() {
-        // Probe MonthNamesLanguages.al Months_Dutch_Belgium_2067 and Months_Dutch_1043 (assumption month-names-dutch).
+        // format-evaluate/MonthNamesLanguages.al:71-96 (2067), :108-133 (1043).
         let day = |m: u32, d: u32| day_from_civil(2026, m, d);
         let long = [
             "januari",

@@ -1,4 +1,7 @@
 //! Runtime values (ADR-010).
+//!
+//! The state of a page is not here (ADR-072: al-vm `pages/state/mod.rs`). Entry points: `Value`,
+//! `RtType`, `RecordState`, `Instance`, `DotNetObject`.
 
 pub use crate::page_handle::{ControlHandle, PageHandle};
 use rust_decimal::Decimal;
@@ -525,8 +528,12 @@ pub struct RecordState {
     /// (session-system/TestCrmTableNoConnectionContracts.al).
     pub crm: bool,
     /// Field values in the table's field order.
-    pub fields: Vec<Value>,
+    pub fields: crate::record_fields::Fields,
     pub filters: Vec<crate::filter::FieldFilter>,
+    /// Copies of the filters in `filters` that a measured setter set on a Decimal field whose SQL column cuts their values
+    /// (al-vm `decimal_column::measured_setter`): a read compares such a filter cut only while the identical filter is here.
+    /// `SetRange` and `SetFilter` drop the entry of their field and group; every copy of the record copies it with `filters`.
+    pub decimal_cut_filters: Vec<crate::filter::FieldFilter>,
     /// The filter group `SetRange` and `SetFilter` write to and `GetFilter` reads.
     pub filter_group: i32,
     /// Primary keys marked with `Mark(true)`, and whether `MarkedOnly` restricts the set to them.
@@ -599,6 +606,8 @@ pub struct RecordState {
     pub row_origin: Option<RowOrigin>,
     /// The variable's own Insert and its own Get of that row after it (see [`OwnRead`]).
     pub own_read: OwnRead,
+    /// The read of a row holding a Time stored past the day that the variable's buffer holds (see [`RolledRead`]).
+    pub rolled_read: RolledRead,
     /// The record is a source the Blob copy probes measured (see [`ProbedSource`]).
     pub probed_source: ProbedSource,
     /// The table's and its extensions' global variables of this record variable (ADR-021).
@@ -606,10 +615,14 @@ pub struct RecordState {
     /// Every use of the record refuses with this reason: what its buffer holds is not pinned (the row a page closed on after
     /// `Page.RunModal(Id, Rec)` called as a statement, see `hand_back_selection`).
     pub unpinned_buffer: Option<&'static str>,
-    /// A by-value copy whose filters were dropped on an assumption (`by-value-record-no-filters` or
-    /// `by-value-table-proc-other-table`, al-vm `records/by_value_view.rs`): a read of its view marks it. Clones of the state
+    /// A by-value copy whose filters were dropped on an assumption (`by-value-table-proc-other-table`,
+    /// `by-value-report-procedure`, al-vm `records/by_value_view.rs`): a read of its view marks it. Clones of the state
     /// keep it; `Reset`, `SetView` and `Clear` end it.
     pub view_assumption: Option<crate::assumptions::Assumption>,
+    /// A by-value copy that did not take its caller's SetAutoCalcFields (al-vm `records/by_value_view.rs`
+    /// `measured_auto_calc`): a row read of it that calculates no field marks `by-value-record-no-auto-calc`
+    /// (al-vm `flowfields.rs` `auto_calculate`). Clones of the state keep it.
+    pub auto_calc_dropped: bool,
     /// The filters an action's `RunPageLink` put on this Rec of the page it opened: a copy of Rec passed by value does not
     /// carry them (testpage/TestActionRunPageLinkFilterGroup.al:292-369, `filters=` in OnOpenPage and OnAfterGetCurrRecord).
     pub run_page_link: Option<Rc<Vec<crate::filter::FieldFilter>>>,
@@ -645,6 +658,30 @@ impl Clone for OwnRead {
     fn clone(&self) -> Self {
         OwnRead(None)
     }
+}
+
+/// The primary key of a database row holding a Time stored as 23:59:59.999 (al-vm `sqltime::is_rolled`) and which read put
+/// it into the buffer: the variable's own `Get` from AL code, or ModifyAll's read of each row. A Modify keeps the stored value
+/// of such a field only after that read (al-vm `records/time_rollover.rs`). Every other load, every record method but Modify,
+/// `:=` into the variable and a builtin given the variable end it; a Modify uses it up.
+///
+/// `Clone` gives `None`: a copy of a record state (a record passed by value, xRec) is not the variable that read the row.
+#[derive(Debug, Default)]
+pub struct RolledRead(pub Option<(RolledReadBy, Vec<Value>)>);
+
+impl Clone for RolledRead {
+    fn clone(&self) -> Self {
+        RolledRead(None)
+    }
+}
+
+/// Which read made a [`RolledRead`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RolledReadBy {
+    /// `Get` that AL code called on a Record variable.
+    Get,
+    /// ModifyAll, for the row it modifies.
+    ModifyAll,
 }
 
 /// See [`OwnRead`].
@@ -688,7 +725,7 @@ pub struct RowOrigin {
     /// A read by a Find, FindFirst, FindLast, FindSet or Next, not by Get, gave the buffer its committed version.
     pub from_find: bool,
     /// A `Get` gave the buffer its version (not GetBySystemId, not a Find), committed or written in the open transaction. Read
-    /// only by the xRec rule of al-runner issue 8189 (al-vm `records/nested_validate.rs` `measured_buffer`).
+    /// only by the xRec rule of record/validate/XRecTableProcThroughCodeunit.al (al-vm `records/nested_validate.rs` `measured_buffer`).
     pub by_get: bool,
 }
 
@@ -827,14 +864,22 @@ impl RecordState {
     /// IsDirty, RecordRef.IsDirty and Modify compare with (`is_dirty_base`, `dirty_base`, `last_modify`).
     pub fn blob_copies_of(&self, pos: usize, b: &crate::stream::BlobRef) -> usize {
         let holds = |row: &[Value]| matches!(row.get(pos), Some(Value::Blob(o)) if std::sync::Arc::ptr_eq(o, b));
-        let mut rows: Vec<&[Value]> = vec![&self.fields];
-        rows.extend(self.dirty_base.as_deref());
-        rows.extend(self.last_modify.as_deref());
-        if let DirtyBase::Row { base, alt, .. } = &self.is_dirty_base {
-            rows.push(base);
-            rows.extend(alt.as_deref());
-        }
-        rows.into_iter().filter(|r| holds(r)).count()
+        // Without a vector of the rows: every write through an OutStream on a temporary record's Blob counts here.
+        let (base, alt) = match &self.is_dirty_base {
+            DirtyBase::Row { base, alt, .. } => (Some(base.as_slice()), alt.as_deref()),
+            _ => (None, None),
+        };
+        [
+            Some(&self.fields[..]),
+            self.dirty_base.as_deref(),
+            self.last_modify.as_deref(),
+            base,
+            alt,
+        ]
+        .into_iter()
+        .flatten()
+        .filter(|r| holds(r))
+        .count()
     }
 
     /// A copy of the record that is a variable of its own: a by-value parameter (also a temporary one). It reads the
@@ -990,6 +1035,14 @@ impl TableGlobals {
     pub fn instances(&self) -> Vec<(u32, Rc<RefCell<Instance>>)> {
         match &*self.data.borrow() {
             Some(d) => d.borrow().instances.clone(),
+            None => Vec::new(),
+        }
+    }
+
+    /// The instances of `xRec`'s set, without making the set ([`TableGlobals::xrec`] makes it).
+    pub fn xrec_instances(&self) -> Vec<(u32, Rc<RefCell<Instance>>)> {
+        match &*self.data.borrow() {
+            Some(d) => d.borrow().xrec.instances(),
             None => Vec::new(),
         }
     }
@@ -1439,7 +1492,7 @@ pub struct ModuleInfoState {
     pub version: Option<[i32; 4]>,
     pub dependencies: Vec<[u8; 16]>,
     /// The module BC makes up for the null app id: only its data version is pinned
-    /// (session-system/TestEnvironmentUserTenantContracts.al:195-201); the other properties are refused.
+    /// (session-system/TestEnvironmentUserTenantContracts.al:192-198); the other properties are refused.
     pub synthesized: bool,
 }
 
@@ -1471,11 +1524,20 @@ pub struct Instance {
     pub born: Born,
     /// The session watches this single instance's globals (al-vm `single_track.rs`).
     pub single: bool,
-    /// Why what this single instance holds is not the value BC has: every read of one of its globals is refused with this
-    /// reason (al-vm `single_unmeasured.rs`). `None` for every other instance.
-    pub unmeasured: Option<Rc<str>>,
+    /// What a read of one of this single instance's globals does, when the run found its state somewhere no pin covers
+    /// (al-vm `single_unmeasured.rs`). `None` for every other instance.
+    pub unmeasured: Option<SingleMark>,
     /// Counts the instance as live while it exists (`instance_cycles::live`).
     pub live: crate::instance_cycles::LiveCount,
+}
+
+/// The mark of a single instance whose state the run found somewhere no pin covers ([`Instance::unmeasured`]).
+#[derive(Debug, Clone)]
+pub enum SingleMark {
+    /// What it holds is not BC's value: every read of one of its globals is refused with this reason.
+    Refused(Rc<str>),
+    /// What it holds is BC's value by this assumption entry: every read of one of its globals marks it.
+    Assumed(crate::assumptions::Assumption),
 }
 
 thread_local! {

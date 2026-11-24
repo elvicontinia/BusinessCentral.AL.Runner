@@ -8,6 +8,11 @@
 //!   Y89_All_OpenEdit_delall{,upd}_{first,next,previous,last,goto}) Last raises the pair twice and First, Next, Previous and GoToKey
 //!   raise nothing; every one answers No.
 //! - A second action that leaves the table empty again raises the pair twice (`second action log`).
+//!
+//! A List with the new-row line that lost its only row to an action: First and Last on its blank
+//! line, a second action, and the OnQueryClosePage of a card its deleted row closes (corpus
+//! pages/deleted-rows). Entry points: `gone_blank_line_move`, `gone_blank_line_second_action`,
+//! `card_query_close_before_forced_close`.
 
 use super::*;
 use al_builtins::page_op::PageMethod;
@@ -60,7 +65,7 @@ impl Session {
         if st.borrow().cursor != Cursor::None || !self.on_gone_blank_line(st)? {
             return Ok(false);
         }
-        st.borrow_mut().refresh = false;
+        st.borrow_mut().refresh.cancel();
         st.borrow_mut().window.clear();
         self.land_on_new_line(st)?;
         self.land_on_new_line(st)?;

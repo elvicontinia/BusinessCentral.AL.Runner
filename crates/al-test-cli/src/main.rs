@@ -2,6 +2,14 @@
 //!
 //! Exit codes: 0 ok, 1 regression against the baseline, 2 setup error
 //! (oracle and corpus disagree, unreadable input, bad arguments).
+//!
+//! The binary: run each oracle version, report, check the not-passing lists. Exit 0 ok, 1 a list does
+//! not hold, 2 setup error. A version runs in passes (`passes`, `run_version_passes`): the main app
+//! with the suites of the main environment, then one pass per set of `extra_apps` (oracle.toml) with
+//! only those suites; the reports are joined before `--json`/`--markdown` are written. The main pass
+//! keeps its compile (`PassCompile`), and the next pass grows it by its own apps (ADR-063;
+//! `AL_FRESH_PASS_COMPILE=1` turns it off). Entry points: `main`, `run`, `run_version_passes`,
+//! `run_version`, `find_explained`, `drift_summary`.
 
 use al_host::dotnet::DotNetHost;
 use al_test_cli::args::{self, Args, Parsed};
@@ -43,6 +51,8 @@ fn write_permission_shadow() {
 }
 
 fn main() -> ExitCode {
+    // Keep the executable open from the start: the build hash of the compile cache is made later (issue 8691).
+    let _ = al_testrun::compile_cache::pin_running_executable();
     // A crash (SIGSEGV and the like) names the test it hit instead of ending the run without a word.
     al_testrun::crash::install();
     // An AL call nests native frames of the bytecode loop; give the runner thread room.
@@ -139,6 +149,9 @@ fn run() -> Result<ExitCode, String> {
     }
     if let Some(dir) = &args.coverage_map {
         return coverage_map(&root, dir.as_deref());
+    }
+    if let Some(version) = &args.print_symbols {
+        return print_symbols(&args, &root, version);
     }
     if let Some(dir) = &args.must_not_compile {
         return must_not_compile(&args, &root, dir.as_deref());
@@ -362,6 +375,29 @@ fn must_not_compile(args: &Args, root: &Path, dir: Option<&Path>) -> Result<Exit
     print!("{}", al_test_cli::mnc::render(&outcomes, major));
     let bad = al_test_cli::mnc::Summary::of(&outcomes).mismatched;
     Ok(ExitCode::from(u8::from(bad > 0)))
+}
+
+/// `--print-symbols VERSION`: the corpus preprocessor symbols of a BC version (`al_version::corpus_symbols`),
+/// comma-separated on one line. `tools/corpus-writer/compile-legs.sh` and the symbol check of `tools/corpus_bump.sh`
+/// read them here, so the rule has one owner (ADR-078 point 3).
+fn print_symbols(args: &Args, root: &Path, version: &str) -> Result<ExitCode, String> {
+    let v = al_version::BcVersion::parse(version).map_err(|e| format!("--print-symbols `{version}`: {e}"))?;
+    let symbols: Vec<String> = al_version::corpus_symbols(&v, &released_minors(args, root)?)
+        .into_iter()
+        .collect();
+    println!("{}", symbols.join(","));
+    Ok(ExitCode::SUCCESS)
+}
+
+/// The released minors of `--released-minors LIST` (comma-separated, not empty), else those the oracle table records.
+fn released_minors(args: &Args, root: &Path) -> Result<al_version::ReleasedMinors, String> {
+    if let Some(list) = &args.released_minors {
+        let entries: Vec<&str> = list.split(',').map(str::trim).filter(|e| !e.is_empty()).collect();
+        return al_version::ReleasedMinors::parse(&entries).map_err(|e| format!("--released-minors: {e}"));
+    }
+    let oracle_path = args.oracle.clone().unwrap_or_else(|| root.join("oracle/oracle.toml"));
+    let cfg = config::OracleFile::parse(&read(&oracle_path)?).map_err(|e| format!("{}: {e}", oracle_path.display()))?;
+    Ok(cfg.released())
 }
 
 /// What one version's run leaves for the comparison across versions.
@@ -881,6 +917,46 @@ fn check_companies(companies: &al_host::Companies) -> Result<(), String> {
         .map_err(|e| format!("--companies: {e}"))
 }
 
+/// What the run reads from the artifacts of its BC build: the license (ADR-060) and the emit version of the
+/// missing-object error (al-vm `emit_version`, read on its first use).
+fn build_facts(
+    build: &al_deps::build::BuildId,
+    provision: &deps::Provision,
+    cache_dir: Option<&Path>,
+) -> Result<(al_testrun::license::LicenseUse, al_vm::emit_version::EmitVersion), String> {
+    let fetch = al_deps::artifact::Fetch {
+        cache_root: al_deps::cache::cache_root_from_env(cache_dir),
+        download: provision.download,
+        query: provision.query.clone(),
+        local_artifacts: provision.local_artifacts.clone(),
+        country: provision.country.clone(),
+    };
+    let license =
+        al_testrun::license::LicenseUse::from_artifact(&al_deps::artifact::HttpCdn::from_env(), &fetch, build)?;
+    let emit_version = al_testrun::emit_version::of_build(
+        build,
+        &fetch.cache_root,
+        fetch.download,
+        fetch.local_artifacts.as_deref(),
+    );
+    Ok((license, emit_version))
+}
+
+/// The ten slowest tests of a run that took any time, slowest first (`report::Timings::slowest_tests`).
+fn slowest_tests(results: &[al_testrun::runtime::TestResult]) -> Vec<report::SlowTest> {
+    let mut all: Vec<&al_testrun::runtime::TestResult> = results.iter().collect();
+    all.sort_by_key(|r| std::cmp::Reverse(r.time));
+    all.into_iter()
+        .take(10)
+        .filter(|r| !r.time.is_zero())
+        .map(|r| report::SlowTest {
+            codeunit: r.codeunit,
+            name: r.test.clone(),
+            seconds: r.time.as_secs_f64(),
+        })
+        .collect()
+}
+
 #[allow(clippy::too_many_arguments)]
 fn run_version_inner(
     args: &Args,
@@ -1059,7 +1135,7 @@ fn run_version_inner(
     for note in &chosen.notes {
         eprintln!("note: {note}");
     }
-    let symbols = al_version::corpus_symbols(chosen.target.bc.major);
+    let symbols = al_version::corpus_symbols(&chosen.target.bc, &cfg.released());
     // The corpus apps CI publishes before the main app (the internals fixture, the cross-app fixtures, including
     // fixture D, which the main app does not depend on), in CI's order, then the main app (corpus
     // `.github/workflows/ci.yml`, `app_dirs`; `deps::corpus_publish_dirs`).
@@ -1092,6 +1168,7 @@ fn run_version_inner(
     let mut bc_build = None;
     // ADR-060: the license of the BC artifacts the run uses; none without them (`--no-deps`, or every dependency on disk).
     let mut license = al_testrun::license::LicenseUse::none("no BC artifact is used by this run");
+    let mut emit_version = al_vm::emit_version::EmitVersion::default();
     if !args.no_deps {
         // Dependencies go after the corpus apps, so the corpus objects keep their positions.
         // ADR-013 Layer A: the oracle leg is the explicit `--bc-version`, so the Microsoft build
@@ -1117,18 +1194,7 @@ fn run_version_inner(
                 println!("bc build: {} ({})", u.build, origin_word(u.origin));
                 chosen.target.bc.resolved_to(&u.build.to_string())?;
                 bc_build = Some(u.build.to_string());
-                let fetch = al_deps::artifact::Fetch {
-                    cache_root: al_deps::cache::cache_root_from_env(args.cache_dir.as_deref()),
-                    download: provision.download,
-                    query: provision.query.clone(),
-                    local_artifacts: provision.local_artifacts.clone(),
-                    country: provision.country.clone(),
-                };
-                license = al_testrun::license::LicenseUse::from_artifact(
-                    &al_deps::artifact::HttpCdn::from_env(),
-                    &fetch,
-                    &u.build,
-                )?;
+                (license, emit_version) = build_facts(&u.build, &provision, args.cache_dir.as_deref())?;
             }
             None => println!("bc build: none needed (every dependency came from --deps)"),
         }
@@ -1254,6 +1320,7 @@ fn run_version_inner(
         // The corpus has no test data: its oracle is a database the cases fill themselves.
         test_data: None,
         license: license.license.clone(),
+        emit_version,
         company_data: None,
         compile_cache,
         test_time_limit: None,
@@ -1297,10 +1364,9 @@ fn run_version_inner(
         allow_write_in_try_functions: pass.settings.allow_write_in_try_functions,
         // `dev_endpoint_ui` stays off: the corpus runs as Microsoft's Test Runner app does, so unhandled UI is an error.
         private_baseline: std::env::var_os("AL_PRIVATE_BASELINE").is_some(), // ADR-069 decision 11
-        // Internal, for the ADR-070 step 2 comparison: the whole corpus in BC's order (`AL_STRICT_ORDER_ALL`), and the
-        // sequential strict run (`AL_STRICT_SEQUENTIAL`).
+        login_replay_check: std::env::var_os("ALRUNNER_LOGIN_REPLAY_CHECK").is_some(), // issue 8211, internal
+        // Internal: the whole corpus in BC's order (`AL_STRICT_ORDER_ALL`; ADR-070 decision 5).
         strict_order: std::env::var_os("AL_STRICT_ORDER_ALL").is_some(),
-        strict_sequential: std::env::var_os("AL_STRICT_SEQUENTIAL").is_some(), // ADR-070 step 2 (internal)
         ..Default::default()
     };
     let load_time = started.elapsed();
@@ -1335,6 +1401,7 @@ fn run_version_inner(
     // Nothing waits for the drop of the runtime after the report is written.
     let rt = runtime::Retiring::new(rt);
     let p = &rt.phases;
+    p.login_replay.iter().for_each(|l| eprintln!("{l}")); // ALRUNNER_LOGIN_REPLAY_CHECK (issue 8211)
     let sidecar_stats = sidecar_host.stats();
     sidecar_host.shutdown();
     let timings = report::Timings {
@@ -1355,19 +1422,7 @@ fn run_version_inner(
                 tests_s: d.as_secs_f64(),
             })
             .collect(),
-        slowest_tests: {
-            let mut all: Vec<&al_testrun::runtime::TestResult> = rt.results().iter().collect();
-            all.sort_by_key(|r| std::cmp::Reverse(r.time));
-            all.into_iter()
-                .take(10)
-                .filter(|r| !r.time.is_zero())
-                .map(|r| report::SlowTest {
-                    codeunit: r.codeunit,
-                    name: r.test.clone(),
-                    seconds: r.time.as_secs_f64(),
-                })
-                .collect()
-        },
+        slowest_tests: slowest_tests(rt.results()),
     };
     if args.timings {
         eprintln!(

@@ -1,10 +1,13 @@
 //! The key of a cache entry: every input of the compile of the dependency set.
+//!
+//! The key of an entry: every input of the compile of the dependency set, hashed without `..`. Entry
+//! points: `Key`, `Key::digest`, `AppKey`, `FORMAT`.
 
 use sha2::{Digest, Sha256};
 
 /// The format integer of the entry file. Bump it when the layout of the file or of a type it
 /// stores changes. (Any change to the compiler already changes `Key::runtime_build`.)
-pub const FORMAT: u32 = 26;
+pub const FORMAT: u32 = 27;
 
 /// One dependency app, as the compile saw it.
 #[derive(Debug, Clone, PartialEq, Eq)]

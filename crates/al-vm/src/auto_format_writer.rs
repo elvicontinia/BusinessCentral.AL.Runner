@@ -15,6 +15,15 @@
 //!    raised (docs/probes-needed.md, "AutoFormatType of a decimal control").
 //!
 //! Type 0 and no type have no check: Format of a plain field raises nothing (P114GlobalTriggerEvents.al:341-347).
+//!
+//! a subscriber outside Microsoft's apps (a dependency app published by Microsoft) that can write the
+//! result of AutoFormatTranslate (UI Helper Triggers) or of OnResolveAutoFormat /
+//! OnAfterResolveAutoFormat (Auto Format), events the runtime does not raise (al-runner issue 8011):
+//! the four tiers by what the test can see (`Unraised::seen_by`). Entry points:
+//! `Session::auto_format_writer_refusal`, called by `pages/auto_format_writer_cell.rs` (page
+//! controls, with the two measured cells), `column_formatter.rs` `decimal_column_formatter` (report
+//! columns) and the `System.AutoFormatWriterGuard#1` builtin that lowering
+//! (`Lowerer::auto_format_writer_guard`) puts before `Format` and StrSubstNo of such a field.
 
 use crate::Session;
 use crate::events::Unraised;
@@ -26,7 +35,10 @@ static EVENTS: std::sync::LazyLock<[((String, String), &str); 3]> = std::sync::L
     let key = |c: &str, e: &str| (c.to_string(), e.to_string());
     [
         (
-            key("ui helper triggers", "autoformattranslate"),
+            key(
+                &crate::events::unraised_key(al_ir::UI_HELPER_CODEUNIT),
+                "autoformattranslate",
+            ),
             "AutoFormatTranslate of UI Helper Triggers",
         ),
         (
@@ -71,13 +83,20 @@ impl Session {
         None
     }
 
-    /// Subscriber `u` is outside Microsoft's apps, is static or bound now, and may write a `var` parameter (every `var` parameter
-    /// of the three events is a result: Translation, Result, Resolved).
-    ///
-    /// Microsoft's apps: a dependency app whose publisher is "Microsoft". The app under test is never one, whatever publisher it
-    /// names (review of PR 8015: a test app published as "Microsoft" runs its subscriber in BC). A known hole: a partner
-    /// dependency package that names "Microsoft" as its publisher counts as Microsoft's (docs/probes-needed.md, "AutoFormatType
-    /// of a decimal control").
+    /// Whether app `app` is one of Microsoft's apps: a dependency app whose publisher is "Microsoft". The app under test is
+    /// never one, whatever publisher it names (review of PR 8015: a test app published as "Microsoft" runs its subscriber in
+    /// BC). A known hole: a partner dependency package that names "Microsoft" as its publisher counts as Microsoft's
+    /// (docs/probes-needed.md, "AutoFormatType of a decimal control").
+    pub(crate) fn of_microsoft_app(&self, app: u32) -> bool {
+        self.engine
+            .program
+            .apps
+            .get(app as usize)
+            .is_some_and(|a| a.dependency && a.publisher == "Microsoft")
+    }
+
+    /// Subscriber `u` is outside Microsoft's apps ([`Session::of_microsoft_app`]), is static or bound now, and may write a
+    /// `var` parameter (every `var` parameter of the three events is a result: Translation, Result, Resolved).
     fn active_foreign_writer(&self, u: &Unraised) -> bool {
         let program = &self.engine.program;
         // The head only: a subscriber of Microsoft's apps is not made to be read (ADR-054).
@@ -85,8 +104,7 @@ impl Session {
             .objects
             .heads()
             .get(u.object)
-            .and_then(|h| program.apps.get(h.app as usize))
-            .is_some_and(|a| a.dependency && a.publisher == "Microsoft");
+            .is_some_and(|h| self.of_microsoft_app(h.app));
         if microsoft || (u.manual && !self.is_bound_object(u.object)) {
             return false;
         }

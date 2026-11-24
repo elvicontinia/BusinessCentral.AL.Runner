@@ -2,6 +2,15 @@
 //! the runner reads is derived from that file's expectations; the shapes it does not pin are refused as the page opens. Outside
 //! every chain: the turns to visible (`read_hidden_parts_the_action_showed`, which runs one pinned shape and refuses the
 //! rest, and `note_hidden_part_found_visible`).
+//!
+//! Parts a Visible expression hid: the Provider-chain shapes of
+//! testpage/parts/ProviderLinkedPartsMatrix.al, and outside every chain the turns to visible: one
+//! pinned turn by an action's body, an extra read (`read_hidden_parts_the_action_showed`;
+//! `first_turn_as_pinned` lists the conditions, every other turn in an action body is refused); a
+//! turn by the host's trigger or an OnValidate, flagged `hidden-part-shown-outside-action`
+//! (`note_hidden_part_found_visible`, per refill: `PageState::visible_at_sync`, `seen_visible`).
+//! Entry points: `read_blank_before_parts_turning_visible`, `before_action_body`,
+//! `read_hidden_parts_the_action_showed`, `note_hidden_part_found_visible`.
 
 use super::*;
 
@@ -56,10 +65,10 @@ impl Session {
     pub(super) fn read_chain_parts_skipped_at_refill(&mut self, st: &St) -> Result<(), Signal> {
         let pending: Vec<(usize, St)> = Self::open_parts_with_hidden(st)
             .into_iter()
-            .filter(|(_, c)| c.borrow().chain_refill == 2)
+            .filter(|(_, c)| c.borrow().chain_refill == ChainRefill::AwaitingKey)
             .collect();
         for (i, c) in pending {
-            c.borrow_mut().chain_refill = 0;
+            c.borrow_mut().chain_refill = ChainRefill::Off;
             let linked = {
                 let engine = self.engine();
                 page_of(&engine, st).controls[i]
@@ -295,7 +304,7 @@ impl Session {
             before.pinned_host_rec = Some(match (mismatch, journal_miss) {
                 (Some(_), Some(journal)) if self.journal_host_type(st).is_some() => Err(journal),
                 (Some(reason), Some(_)) => Err(reason),
-                _ => Ok(self.page_rec(st).borrow().fields.clone()),
+                _ => Ok(self.page_rec(st).borrow().fields.to_vec()),
             });
         }
         Ok(before)
@@ -361,12 +370,12 @@ impl Session {
             s.open
                 && s.cursor == Cursor::Row
                 && !s.draft
-                && !s.refresh
+                && !s.refresh.asked()
                 && !s.save_record_called
                 && Self::same_values(&self.page_rec(st).borrow().fields, rec_before)
                 && Self::open_parts_with_hidden(st)
                     .iter()
-                    .all(|(_, c)| !c.borrow().refresh && !c.borrow().save_record_called)
+                    .all(|(_, c)| !c.borrow().refresh.asked() && !c.borrow().save_record_called)
         };
         let linked_by_fields = before.journal.is_some() || {
             let engine = self.engine();
