@@ -89,8 +89,22 @@ impl Session {
                 // `hasfilter=Yes;...;view=VERSION(1) SORTING(Field1) WHERE(Field1=1(P1))`, :407 G616_FlowFilterLink_CopyFilter).
                 RecordOp::HasFilter | RecordOp::GetView | RecordOp::CopyFilter => true,
                 RecordOp::Insert | RecordOp::Init => rec.borrow().temporary && args.is_empty(),
+                // SetRecFilter filters the primary key on the buffer, whose linked fields are filled, and keeps the link's filter
+                // on another field; the page then opens on those filters (assumption `run-page-link-open-set-rec-filter`, probe
+                // cells R1-R4: a Card and a List linked on the key, with and without a RunPageView sorting on it, and a Card
+                // linked on another field). Another filter group or current key, and a key of several fields, were not measured.
+                RecordOp::SetRecFilter => {
+                    let r = rec.borrow();
+                    let one_field_key = self.engine.tables[r.table as usize]
+                        .as_ref()
+                        .is_some_and(|t| t.keys.first().is_some_and(|k| k.len() == 1));
+                    r.filter_group == 0 && r.key == 0 && one_field_key
+                }
                 _ => false,
             };
+        if find_read && method == RecordOp::SetRecFilter {
+            al_builtins::assumptions::assume(al_builtins::assumptions::Assumption::RunPageLinkOpenSetRecFilter);
+        }
         // SetView replaces the view of group 0, the link included, and leaves the SourceTableView's group 2 and the RunPageView's
         // group 3; the linked fields stay, and Rec then answers as any record of its new view (corpus
         // testpage/RunPageLinkOpenSetView.al, corpus PR 1150: RSV_LinkAndView_SameView, _OtherFilter, _EmptyView,
