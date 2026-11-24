@@ -5,6 +5,8 @@
 //! methods in `records.rs` (triggers included). `FieldRef` and `KeyRef` point
 //! into that buffer by field position and key index. Behaviour the corpus
 //! does not pin raises `Signal::Unsupported` instead of guessing.
+//!
+//! Entry points: `record_ref_value`.
 
 use crate::Session;
 use crate::blob_transfer::{BlobMove, Holder};
@@ -266,6 +268,7 @@ impl Session {
         } else {
             id
         };
+        let (id, setrange) = crate::setrange_convert::catalog_id(id);
         let Some(sig) = catalog().by_id(id) else {
             return unsupported(format!("builtin {id}"));
         };
@@ -283,6 +286,9 @@ impl Session {
             }
             "FieldRef" => {
                 self.fieldref_arg_values(&sig.name, &lib, args)?;
+                if matches!(sig.name.as_str(), "SetRange" | "SetFilter") {
+                    self.fieldref_setrange_convert(&sig.name, &lib, args, setrange)?;
+                }
                 self.fieldref_op(&sig.name, &lib, args)
             }
             "KeyRef" => self.keyref_op(&sig.name, &lib, args),
@@ -418,7 +424,7 @@ impl Session {
         if o.uncompiled {
             return unsupported("Evaluate into a RecordId of a table of an app that is not compiled");
         }
-        let table_no = o.id.unwrap_or(0);
+        let table_no = crate::object_ids::declared_id(o.id)?;
         let table_name = o.name.clone();
         let key = match key_text {
             None => Vec::new(),
@@ -806,8 +812,12 @@ impl Session {
                             "RecordRef.IsDirty after GetTable of a record whose row was stored again since it was read (not pinned)",
                         );
                     }
-                    Some(row) => row,
-                    None => self.initial_fields(t.object as usize),
+                    Some(mut row) => {
+                        // Compared with what the record reads (`sqltime::read_back`).
+                        crate::sqltime::read_back(&mut row);
+                        row
+                    }
+                    None => self.initial_fields(t.object as usize).into_vec(),
                 }
             }
         };
@@ -914,10 +924,12 @@ impl Session {
             }
         }
         let new_ref_tried = crate::unopened_refs::open_attempt_on_new_ref(method, &lib.borrow());
+        let trace = self.relation_field_no_trace_step(method, &lib.borrow(), args);
         let r = match group1 {
             Some((rec, use_)) => self.with_group1(&rec, use_, |s| s.recordref_op_inner(method, lib, args)),
             None => self.recordref_op_inner(method, lib, args),
         };
+        self.relation_field_no_after_recordref_op(trace, method, &lib.borrow(), &r);
         if new_ref_tried {
             crate::unopened_refs::after_open_attempt(method, lib, &r);
         }
@@ -935,7 +947,7 @@ impl Session {
         if let Some(keep) = snapshot {
             if let LibraryValue::RecordRef(rec) = &*lib.borrow() {
                 let mut s = rec.borrow_mut();
-                s.dirty_base = keep.then(|| s.fields.clone());
+                s.dirty_base = keep.then(|| s.fields.to_vec());
             }
         }
         r
@@ -1073,9 +1085,9 @@ impl Session {
         let rec = Self::open_ref(lib, &format!("RecordRef.{method}"))?;
         let t = self.table(&rec)?;
         match method {
-            "Number" => Ok(Value::Integer(
-                self.engine.program.objects[t.object as usize].id.unwrap_or(0) as i32,
-            )),
+            "Number" => Ok(Value::Integer(crate::object_ids::declared_id(
+                self.engine.program.objects[t.object as usize].id,
+            )? as i32)),
             "Name" => Ok(Value::Text(t.name.clone().into())),
             "Caption" => self.caption_checked(&t).map(|c| Value::Text(c.into())),
             // corpus recordref-fieldref/recordref/TestRecordRefGetSet.al:16-30 pins only that it is not empty.
@@ -1102,14 +1114,16 @@ impl Session {
             }
             "SetView" => {
                 let view = al_builtins::native::text_of(args.first().unwrap_or(&Value::Null)).unwrap_or_default();
-                self.set_view(&rec, &t, &view).map(|()| Value::Null)
+                self.set_view(&rec, &t, &view)?;
+                self.relation_field_no_filter_set(&rec, None);
+                Ok(Value::Null)
             }
             "SetLoadFields" | "AddLoadFields" | "AreFieldsLoaded" | "LoadFields" => {
                 self.recordref_load_fields(method, &rec, &t, args)
             }
             "SetAutoCalcFields" => self.recordref_set_auto_calc_fields(&rec, &t, args),
             // Doc (RecordRef.Duplicate): a new ref with the same table, buffer and filters, independent of the original.
-            "RecordId" => Ok(self.record_id(&rec, &t)),
+            "RecordId" => self.record_id(&rec, &t),
             "LockTable" => {
                 // RecordRef.LockTable(true, true) raises the Wait = FALSE error (recordref-fieldref/recordref/RfTViews.al:314-322).
                 if matches!(args, [Value::Boolean(true), Value::Boolean(true)]) {
@@ -1139,9 +1153,14 @@ impl Session {
                 self.lock_through_recordref(locked, "a locking RecordRef.ReadIsolation");
                 r
             }
-            "ReadConsistency" | "RecordLevelLocking" | "ReadPermission" | "WritePermission" | "CountApprox"
-            | "SecurityFiltering" | "GetPosition" | "SetPosition" | "Ascending" | "SetRecFilter" | "Mark"
-            | "MarkedOnly" | "ClearMarks" => self.record_meta_op(record_method(method), &rec, &t, args),
+            "CountApprox" => {
+                self.relation_field_no_recordref_scan(&rec, RecordOp::CountApprox)?;
+                self.record_meta_op(RecordOp::CountApprox, &rec, &t, args)
+            }
+            "ReadConsistency" | "RecordLevelLocking" | "ReadPermission" | "WritePermission" | "SecurityFiltering"
+            | "GetPosition" | "SetPosition" | "Ascending" | "SetRecFilter" | "Mark" | "MarkedOnly" | "ClearMarks" => {
+                self.record_meta_op(record_method(method), &rec, &t, args)
+            }
             // Doc (RecordRef.Get): loads the row a RecordId names; the table must be the ref's own.
             "Get" => self.rr_get_own_table(&t, &rec, args),
             // As Record.GetBySystemId, and a miss with the result unused raises "The <table> does not
@@ -1227,7 +1246,8 @@ impl Session {
                                 "RecordRef.Field({no}) of a removed field without an ObsoleteReason (the text is not pinned)"
                             ));
                         };
-                        let table_id = self.engine.program.objects[t.object as usize].id.unwrap_or(0);
+                        let table_id =
+                            crate::object_ids::declared_id(self.engine.program.objects[t.object as usize].id)?;
                         Err(crate::transactions::al_error_code(
                             &format!(
                                 "Field {} ({no}) of table {} ({table_id}) is obsoleted, reason: {reason}",
@@ -1542,6 +1562,7 @@ impl Session {
                     if let Value::Unknown(why) = &v {
                         return unsupported(why.to_string());
                     }
+                    self.relation_field_no_fieldref_value(&rec, pos)?;
                     // A coverage Test ID read by number: no pinned shape (platform::coverage_test_id_refusal).
                     if !rec.borrow().temporary && self.is_coverage_test_id(&t, field.id) {
                         return unsupported(al_builtins::platform::coverage_test_id_refusal(
@@ -1551,6 +1572,7 @@ impl Session {
                     let order = {
                         let r = rec.borrow();
                         self.install_row_order(r.table, r.temporary, pos, &r.fields)
+                            .or_else(|| self.restamped_read(&r, pos))
                     };
                     if let Some(why) = order {
                         return unsupported(why);
@@ -1697,12 +1719,16 @@ impl Session {
                 if stored {
                     return unsupported("FieldRef.CalcField of a field that is not a FlowField (not pinned)");
                 }
-                self.flow_op_asked(
+                // A page background task's repeated FieldRef.CalcField answers from the query cache as Record.CalcFields does.
+                let read = self.mark_al_record_read(RecordOp::CalcFields, true);
+                let r = self.flow_op_asked(
                     RecordOp::CalcFields,
                     &rec,
                     &[Value::Integer(pos as i32)],
                     crate::flowfields::Asked::Other,
-                )
+                );
+                self.unmark_al_record_read(read);
+                r
             }
             // FieldRef.CalcSum sums a stored Decimal or Integer field over the rows the RecordRef's filters pass, a field in
             // no SumIndexFields list as well, puts the sum into the field and answers Yes
@@ -1787,7 +1813,9 @@ impl Session {
                 if method == "SetRange" {
                     self.fieldref_setrange_scalars_as_text(&field.ty, &mut a[1..])?;
                 }
-                self.record_op_from_al(record_method(method), &rec, &mut a)
+                let r = self.record_op_from_al(record_method(method), &rec, &mut a)?;
+                self.relation_field_no_filter_set(&rec, Some(pos));
+                Ok(r)
             }
             other => unsupported(format!("FieldRef.{other}")),
         }

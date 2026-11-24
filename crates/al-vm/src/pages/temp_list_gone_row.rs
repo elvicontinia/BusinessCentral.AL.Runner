@@ -4,6 +4,11 @@
 //! TempListRowGone_CloseReopen_DeleteAgain (`cursor-1` R1, `del-1` `[del(R2) agcr(R1) agcr(R1)]`, `next-in-1` R3, the same on the
 //! second open). Only that cell runs; every other such list is refused, because the landing main gives it (the row after) is
 //! the one the probe showed wrong.
+//!
+//! a top-level List over a temporary table whose action deleted the row it stood on with rows left
+//! (al-runner issue 7940): on the probe's read-only list (middle row of three) it lands on the row
+//! before (ReopenSameVariableState.al:469); other such lists refuse. Entry points:
+//! `settle_gone_row_of_temp_list` (from `settle_after_action`).
 
 use super::pinned_shape::{PinnedCode, TestCall, code_stmts, rec_text_log_call, without_pos};
 use super::*;
@@ -46,7 +51,7 @@ impl Session {
             );
         }
         if let Some(fields) = before {
-            rec.borrow_mut().fields = fields;
+            rec.borrow_mut().fields = fields.into();
         }
         let r = self.arrive_after_gone_row(st);
         self.torn_down_on_error(st, r)?;
@@ -57,7 +62,7 @@ impl Session {
     /// - the page's code is `CODE` (`page_code_is`), `Editable = false`, at the top level without parts, opened by the test with
     ///   OpenView, not modal, not a lookup;
     /// - the triggers have the probe's bodies (`probe_bodies`), so the open stood on the last row of the view, and the action
-    ///   asked for no refresh (`refresh` is false);
+    ///   asked for no refresh (`refresh.asked()` is false);
     /// - the view is the primary key without filters or marks (`rec_view_is`), and the client held the whole view of three rows
     ///   from its start, Rec's key the middle one;
     /// - the test's calls since the open: `GoToKey`, then the action's `Invoke`, with one control read before the `GoToKey` on the
@@ -68,7 +73,7 @@ impl Session {
         let opened = {
             let s = st.borrow();
             s.open
-                && !s.refresh
+                && !s.refresh.asked()
                 && s.opened_by_test
                 && s.mode == PageMode::View
                 && !s.modal

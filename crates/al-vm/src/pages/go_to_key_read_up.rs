@@ -1,5 +1,10 @@
 //! GoToKey on a list that opened on the last row of its descending view in a key other than the primary key, the rows above it
 //! read up (`read_rows_up_from_the_landed_last_row`; al-runner issues 6363 and 8172).
+//!
+//! GoToKey on a list that opened on the last row of its descending view in a secondary key, the rows
+//! above it read up (al-runner issues 6363, 8172): runs only in the cells of rows held and rows above
+//! that WdModalGoToKeyDescSecondary.al measures (`MEASURED_HELD_ABOVE`). Entry points:
+//! `go_to_key_from_the_last_row_read_up` (from `page_go_to_key`).
 
 use super::*;
 use al_builtins::record_op::RecordOp;
@@ -27,7 +32,7 @@ impl Session {
         let here = self.row_key(&rec)?;
         let on_last = {
             let s = st.borrow();
-            s.read_up_from_last == Some(false)
+            s.read_up_from_last == ReadUpFromLast::Opened
                 && s.cursor == Cursor::Row
                 && !s.draft
                 && !s.stale
@@ -63,14 +68,14 @@ impl Session {
         };
         // The reads up to the row before the first one.
         for f in up.iter().take(up.len() - 1) {
-            rec.borrow_mut().fields = f.clone();
+            rec.borrow_mut().fields = f.clone().into();
             self.populate_current(st)?;
         }
         {
             let mut s = st.borrow_mut();
             s.window = rows;
             s.window_from_start = true;
-            s.read_up_from_last = Some(true);
+            s.read_up_from_last = ReadUpFromLast::WalkedFromFirst;
         }
         for i in 0..=target {
             let r = self.read_client_row_in(st, i, true);
@@ -95,7 +100,7 @@ impl Session {
         ) {
             return unsupported("GoToKey on a list whose top row held is gone from the table (not pinned)");
         }
-        let mut up = vec![probe.borrow().fields.clone()];
+        let mut up = vec![probe.borrow().fields.to_vec()];
         loop {
             self.ret_used = true;
             if !matches!(self.record_op(RecordOp::Next, &probe, &mut [Value::Integer(-1)])?, Value::Integer(n) if n != 0)
@@ -107,7 +112,7 @@ impl Session {
                     "GoToKey on a list that opened on the last row of its descending view, with more rows above the rows it holds than a window (not pinned)",
                 );
             }
-            up.push(probe.borrow().fields.clone());
+            up.push(probe.borrow().fields.to_vec());
         }
     }
 }

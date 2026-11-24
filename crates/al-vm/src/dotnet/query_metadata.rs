@@ -11,6 +11,9 @@
 //!
 //! Refused: any other stream, a query with a filter element, a column name that is not a plain identifier (none is
 //! pinned), `Item` out of range, every other member.
+//!
+//! Microsoft's `QueryMetadataReader` over a query's Application Object Metadata
+//! (ReQueryMetadataShapes.al). Entry points: `types`, `from_stream`.
 
 use super::registry::{MemberKind, Pin, RegistryMember, RegistryType};
 use crate::Session;
@@ -115,7 +118,7 @@ fn from_stream(s: &mut Session, _: Option<&Rc<DotNetObject>>, args: &[Value]) ->
             QUERY_FIELDS,
             vec![
                 Value::Integer(field_no),
-                Value::Integer(table.id.unwrap_or(0) as i32),
+                Value::Integer(crate::object_ids::declared_id(table.id)? as i32),
                 Value::Text(c.name.clone().into()),
             ],
         ));

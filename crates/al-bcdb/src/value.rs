@@ -1,6 +1,8 @@
 //! Decoded values. A `Value` carries the typed form (so a consumer that loads rows
 //! into a store never re-parses text), and its `Display` is exactly the text bcdb
 //! prints, which is what the differential tests compare.
+//!
+//! Entry points: `Value`, `json_string`, `format_binary`, `format_guid`.
 
 use std::fmt::{self, Write as _};
 
@@ -289,17 +291,6 @@ fn push_time(out: &mut String, units: i64, scale: u8) {
         out.push('.');
         push_padded(out, frac as u128, scale as usize);
     }
-}
-
-pub fn format_binary(b: &[u8]) -> String {
-    const HEX: &[u8; 16] = b"0123456789ABCDEF";
-    let mut s = String::with_capacity(2 + b.len() * 2);
-    s.push_str("0x");
-    for &x in b {
-        s.push(HEX[(x >> 4) as usize] as char);
-        s.push(HEX[(x & 15) as usize] as char);
-    }
-    s
 }
 
 /// .NET `Guid(byte[16]).ToString().ToUpperInvariant()`: the first three groups are

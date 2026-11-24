@@ -18,6 +18,13 @@
 //!
 //! Each judged site reports at most the codes the matrix holds for it; the older pinned checks (`infer.rs`) still judge
 //! the shapes this module does not.
+//!
+//! Implicit conversions at compile time, from the compile matrix of corpus writer Y31
+//! (`tests/conversion_matrix.rs` compares all 33 060 cells; `tests/fixtures/conversion-matrix/known-
+//! mismatches.txt` lists the cells left): operand shapes and kinds (`Operand`, `K`, `Shape`), the
+//! conversion table (`conv_accepts`), the operator table (`binary_verdict`), and the contexts `:=`,
+//! `+=`, arguments, `exit`, operators, `in`, case labels, conditional branches. Entry points:
+//! `conv_operand`, `conv_assign`, `conv_argument`, `conv_binary`, `conv_to_type_of`.
 use super::*;
 use al_syntax::ast::NodeText;
 
@@ -158,11 +165,15 @@ impl Operand {
         }
     }
 
-    /// The type as alc names it in a message.
+    /// The type as alc names it in a message: a namespaced enum as `Enum Ns.Sub."Name"` (corpus must-not-compile 3291 to
+    /// 3293).
     fn name(&self) -> String {
         match &self.name {
             Name::Fixed(n) => (*n).to_string(),
-            Name::Of(Ty::Enum(n)) => format!("Enum \"{n}\""),
+            Name::Of(Ty::Enum(n)) => match n.rsplit_once(crate::types::QUAL_SEP) {
+                Some((ns, last)) => format!("Enum {}.\"{last}\"", crate::types::display_name(ns)),
+                None => format!("Enum \"{n}\""),
+            },
             Name::Of(Ty::Object(ObjKind::Interface, n)) => format!("Interface \"{n}\""),
             Name::Of(Ty::Label) => "Label".into(),
             Name::Of(_) if matches!(self.shape, Shape::Str(1)) => "Char".into(),

@@ -1,3 +1,5 @@
+//! `Session` as the context natives call back into: `FormatCtx` and `Ctx` (`record`, `page`,
+//! `session_op`, files, module lookups).
 use super::*;
 use crate::state::ReportStart;
 
@@ -15,7 +17,7 @@ impl al_builtins::format::FormatCtx for Session {
         self.report
             .curr_report_language
             .or(self.report.run_language)
-            .unwrap_or(self.global_language)
+            .unwrap_or(self.global_language())
     }
     fn region(&self) -> Option<String> {
         self.report.format_region.clone()
@@ -81,7 +83,7 @@ impl al_builtins::format::FormatCtx for Session {
         }
         match self.report.curr_report_language {
             Some(n)
-                if n != self.global_language
+                if n != self.global_language()
                     && !(n == 2067
                         && matches!(
                             self.report.report_preview_pinned.last(),
@@ -102,7 +104,7 @@ impl al_builtins::format::FormatCtx for Session {
     fn region_language_pinned(&self) -> bool {
         match self.report.curr_report_language {
             Some(n) => self.region_language_pinned_for(n),
-            None => self.report.run_language.unwrap_or(self.global_language) == 1033,
+            None => self.report.run_language.unwrap_or(self.global_language()) == 1033,
         }
     }
     /// A read through Format or Evaluate takes the caption a translation file gives (ADR-053 step 2): refused only where
@@ -192,6 +194,9 @@ impl al_builtins::native::Ctx for Session {
     fn format_composite(&mut self, v: &Value) -> Option<Result<String, Signal>> {
         self.format_composite_value(v)
     }
+    fn format_fieldref_read(&mut self, fr: &Value) -> Result<(), Signal> {
+        self.format_fieldref_value_read(fr)
+    }
     fn copy_stream_dotnet(&mut self, out: &Value, src: &Value, count: Option<i64>) -> Option<Result<(), Signal>> {
         Some(self.copy_stream_with_dotnet(out, src, count))
     }
@@ -205,7 +210,11 @@ impl al_builtins::native::Ctx for Session {
         Session::auto_format_writer_refusal(self, kind, false)
     }
     fn last_error(&self) -> AlError {
+        self.bg_note_last_error_read();
         self.last_error.clone()
+    }
+    fn session_without_error(&self) -> bool {
+        self.bg_worker_without_error()
     }
     fn set_last_error(&mut self, e: AlError) {
         self.set_last_error_of_builtin(e);
@@ -227,40 +236,25 @@ impl al_builtins::native::Ctx for Session {
         rec: Option<&mut Value>,
         args: &mut [Value],
     ) -> Result<Value, Signal> {
-        match rec {
-            Some(Value::Record(rc)) => {
-                let rc = rc.clone();
-                if method == al_builtins::record_op::RecordOp::Validate {
-                    // `Record.Validate` in AL code (registry `Record.Validate#1`).
-                    return self.validate_at(crate::records::ValidateSite::AlRecordValidate, &rc, args);
-                }
-                // Taken by the SetFilter of `record_op_inner` (`setfilter_empty_or_side`).
-                self.setfilter_from_al = method == al_builtins::record_op::RecordOp::SetFilter;
-                // A Record variable's `Insert()` under the test runner's permission sets (`runner_sets_insert.rs`).
-                if self.runner_permission_sets && method == al_builtins::record_op::RecordOp::Insert && args.is_empty()
-                {
-                    self.runner_sets_insert(&rc)?;
-                }
-                let before = self.begin_al_record_call(method, &rc);
-                let r = self.record_op_from_al(method, &rc, args);
-                self.end_al_record_call(before);
-                self.setfilter_from_al = false;
-                r
-            }
-            other => Err(Signal::unsupported(format!(
-                "record method {method} on {}",
-                other.describe()
-            ))),
-        }
+        self.al_record(method, rec, args, None)
     }
     fn record_validate_variant(&mut self, rec: Option<&mut Value>, args: &mut [Value]) -> Result<Value, Signal> {
         match rec {
             Some(Value::Record(rc)) => {
                 let rc = rc.clone();
-                Session::record_validate_variant(self, &rc, args)
+                let kind = crate::sequence_start::TableCall::Record {
+                    find_last: false,
+                    set_range: false,
+                    temporary: rc.borrow().temporary,
+                };
+                self.al_table_call(kind, |s| Session::record_validate_variant(s, &rc, args))
             }
             other => Err(Signal::unsupported(format!("Record.Validate on {}", other.describe()))),
         }
+    }
+    fn record_setrange_variant(&mut self, rec: Option<&mut Value>, args: &mut [Value]) -> Result<Value, Signal> {
+        let written = Some(crate::setrange_convert::Written::Variant);
+        self.al_record(al_builtins::record_op::RecordOp::SetRange, rec, args, written)
     }
     fn page(
         &mut self,
@@ -272,16 +266,18 @@ impl al_builtins::native::Ctx for Session {
     }
 
     fn query(&mut self, method: &str, recv: Option<&mut Value>, args: &mut [Value]) -> Result<Value, Signal> {
+        self.note_other_access();
         self.query_op(method, recv, args)
     }
 
     fn ref_op(&mut self, id: &str, receiver: Option<&mut Value>, args: &mut [Value]) -> Result<Value, Signal> {
-        Session::ref_op(self, id, receiver, args)
+        self.counted_ref_op(id, receiver, args)
     }
     fn set_value_from_variant(&mut self, on: bool) {
         self.set_value_from_variant = on;
     }
     fn session_op(&mut self, id: al_ir::BuiltinId, args: &mut [Value]) -> Result<Value, Signal> {
+        self.note_session_call(id);
         Session::session_op(self, id, args)
     }
     fn media_store(&mut self) -> Option<&mut al_builtins::media::MediaStore> {
@@ -388,7 +384,7 @@ impl al_builtins::native::Ctx for Session {
     }
     fn session_locale(&self) -> Option<(i32, i32, String)> {
         Some((
-            self.global_language,
+            self.global_language(),
             self.host.identity.locale_id(),
             self.host.identity.time_zone(),
         ))
@@ -483,6 +479,7 @@ impl al_builtins::native::Ctx for Session {
         let apps = &self.engine.program.apps;
         let parse = |s: &str| ops::parse_guid(s);
         if let Some(i) = apps.iter().position(|a| parse(&a.id).as_ref() == Some(id)) {
+            self.note_footprint_app(i as u32);
             // While an app installs, an app installed after it is not found (corpus branch al-runtime-rs-staging-y3,
             // install-upgrade/install-order/InstallOrderSubscriberTests.al:90-91: getModuleInfo=No during XApp A's install).
             let events = &self.events;
@@ -809,8 +806,8 @@ impl Session {
 
     /// Drops the mark of a file that holds a placeholder report output, for a delete of the file: a delete looks at no byte
     /// (ADR-040 amendment 2026-11-11). AL `File.Erase` of a saved report file after it was opened, copied and closed:
-    /// reports/layouts-saveas/AMRdlcSaveAs.al:179. The DotNet delete calls it only for the shape of assumption
-    /// dotnet-file-delete-placeholder (`placeholder_files.rs`). Whether the path held one.
+    /// reports/layouts-saveas/AMRdlcSaveAs.al:179. The DotNet delete calls it only for the shape
+    /// HtmlServerFileRoundTrip.al:149 pins (`placeholder_files.rs`). Whether the path held one.
     pub(crate) fn forget_placeholder_file(&mut self, path: &str) -> bool {
         if self.placeholder_file_mark(path).is_none() {
             return false;
@@ -840,6 +837,65 @@ impl Session {
                 .format_region
                 .as_deref()
                 .is_some_and(|r| crate::reports::format_region::language_region_pinned(n, r))
+    }
+}
+
+impl Session {
+    /// A Record method called from AL code (`Ctx::record`); `written` says how the values of `Record.SetRange` are written
+    /// where lowering tells it (al-vm `setrange_convert`).
+    fn al_record(
+        &mut self,
+        method: al_builtins::record_op::RecordOp,
+        rec: Option<&mut Value>,
+        args: &mut [Value],
+        written: Option<crate::setrange_convert::Written>,
+    ) -> Result<Value, Signal> {
+        use crate::setrange_convert::Call;
+        match rec {
+            Some(Value::Record(rc)) => {
+                let rc = rc.clone();
+                // A Record write inside a CaptionClass expression whose runs have no pinned number (`pages/caption_runs.rs`).
+                if let Some(why) = self.caption_write_refusal(method) {
+                    return Err(Signal::unsupported(why));
+                }
+                let kind = crate::sequence_start::TableCall::Record {
+                    find_last: method == al_builtins::record_op::RecordOp::FindLast,
+                    set_range: method == al_builtins::record_op::RecordOp::SetRange,
+                    temporary: rc.borrow().temporary,
+                };
+                // A value of another type than the field's (`setrange_convert`), raised where the call's own errors are.
+                let call = match method {
+                    al_builtins::record_op::RecordOp::SetRange => Some(Call::RecordSetRange),
+                    al_builtins::record_op::RecordOp::SetFilter => Some(Call::RecordSetFilter),
+                    _ => None,
+                };
+                self.al_table_call(kind, |s| {
+                    if let Some(call) = call {
+                        s.record_setrange_convert(call, &rc, args, written)?;
+                    }
+                    if method == al_builtins::record_op::RecordOp::Validate {
+                        // `Record.Validate` in AL code (registry `Record.Validate#1`).
+                        return s.validate_at(crate::records::ValidateSite::AlRecordValidate, &rc, args);
+                    }
+                    // Taken by the SetFilter of `record_op_inner` (`setfilter_empty_or_side`).
+                    s.setfilter_from_al = method == al_builtins::record_op::RecordOp::SetFilter;
+                    // A Record variable's `Insert()` under the test runner's permission sets (`runner_sets_insert.rs`).
+                    if s.runner_permission_sets && method == al_builtins::record_op::RecordOp::Insert && args.is_empty()
+                    {
+                        s.runner_sets_insert(&rc)?;
+                    }
+                    let before = s.begin_al_record_call(method, &rc);
+                    let r = s.record_op_from_al(method, &rc, args);
+                    s.end_al_record_call(before);
+                    s.setfilter_from_al = false;
+                    r
+                })
+            }
+            other => Err(Signal::unsupported(format!(
+                "record method {method} on {}",
+                other.describe()
+            ))),
+        }
     }
 }
 

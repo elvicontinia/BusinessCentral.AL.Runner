@@ -288,12 +288,7 @@ impl Session {
             // zero (session-system/TestSystemExtended.al:635-659, TestBCDatabaseContracts.al:100-117).
             // What the database holds committed, raised by the rows the open transaction sent: a row inserted in the open
             // transaction does not count until a Get of its table or a Modify (`Session::last_used_row_version`).
-            ids::DATABASE_LASTUSEDROWVERSION_1 => {
-                return match self.last_used_row_version() {
-                    Ok(v) => Ok(Value::BigInteger(v)),
-                    Err(why) => unsupported(format!("Database.LastUsedRowVersion after {why} (not pinned)")),
-                };
-            }
+            ids::DATABASE_LASTUSEDROWVERSION_1 => return self.last_used_row_version_native(),
             // `min_row_version.rs`.
             ids::DATABASE_MINIMUMACTIVEROWVERSION_1 => return self.minimum_active_row_version(),
             // Set when given a value, read otherwise; the default is the documented one
@@ -320,57 +315,7 @@ impl Session {
                     i32::try_from(self.tx.lock_timeout_duration).unwrap_or(i32::MAX),
                 ));
             }
-            // The type of the transaction (session-system/ProbeSystemEnumMembers.al:60-161, BC 27.5;
-            // TestClearAllTransactionTypeContracts.al:224-253):
-            // - a test starts as UpdateNoLocks, and a set before any database call takes effect;
-            // - after a Commit() the next transaction's type is Update, and a set takes effect again;
-            // - once a write call has run (also a DeleteAll that finds no row) the type stays as it was: a
-            //   set to Report or Snapshot, or to the type it has, goes through without effect, and a set
-            //   to Update raises DB:CannotChangeTransactionType;
-            // - once a read call has run, a set of Report reads back as Update.
-            // Every other set after the transaction has started is not pinned and refused.
-            ids::DATABASE_CURRENTTRANSACTIONTYPE_1 => {
-                use crate::transactions::TxPhase;
-                let members: std::sync::Arc<[String]> = al_builtins::sysenum::option_members("TransactionType")
-                    .expect("a system option")
-                    .into();
-                let new = match args.first() {
-                    None | Some(Value::Null) => return Ok(Value::Option(self.tx.transaction_type, members)),
-                    Some(Value::Option(t, _)) => *t,
-                    Some(other) => return unsupported(format!("CurrentTransactionType set to {}", other.describe())),
-                };
-                let (update, snapshot, report) = (1, 2, 4);
-                // After a lock (codeunits/TestCodeunitRunWriteTransaction.al:211-278) the set is not pinned.
-                if self.tx.phase != TxPhase::Write && self.tx.open.locks.any() {
-                    return unsupported(
-                        "Database.CurrentTransactionType set after a LockTable or a locking ReadIsolation (not pinned)",
-                    );
-                }
-                match self.tx.phase {
-                    TxPhase::Fresh => self.tx.transaction_type = new,
-                    TxPhase::Write if new == self.tx.transaction_type => {}
-                    TxPhase::Write if new == snapshot || new == report => {}
-                    TxPhase::Write if new == update => {
-                        let name = |t: i32| members.get(t as usize).cloned().unwrap_or_default();
-                        return Err(crate::transactions::al_error_code(
-                            &format!(
-                                "The transaction type cannot be changed after a transaction has started.\\\\A transaction starts when the first database operation, such as FIND, NEXT, INSERT, DELETE, MODIFY, SUM, or COUNT, is run.\\\\The error occurred because the transaction type was changed from {} to {}.",
-                                name(self.tx.transaction_type),
-                                name(new)
-                            ),
-                            "DB:CannotChangeTransactionType",
-                        ));
-                    }
-                    TxPhase::Read if new == report => self.tx.transaction_type = update,
-                    _ => {
-                        return unsupported(format!(
-                            "Database.CurrentTransactionType set to {} after a database call (not pinned)",
-                            members.get(new as usize).cloned().unwrap_or_default()
-                        ));
-                    }
-                }
-                return Ok(Value::Null);
-            }
+            ids::DATABASE_CURRENTTRANSACTIONTYPE_1 => return self.current_transaction_type(args),
             _ => {}
         }
         if id == ids::SYSTEM_CODECOVERAGELOG_1 {
@@ -420,17 +365,7 @@ impl Session {
         if let Some((method, n)) = isolated {
             return self.isolated_storage_op(method, n, args);
         }
-        let method = match id {
-            ids::NUMBERSEQUENCE_CURRENT_1 => Some("Current"),
-            ids::NUMBERSEQUENCE_DELETE_1 => Some("Delete"),
-            ids::NUMBERSEQUENCE_EXISTS_1 => Some("Exists"),
-            ids::NUMBERSEQUENCE_INSERT_1 => Some("Insert"),
-            ids::NUMBERSEQUENCE_NEXT_1 => Some("Next"),
-            ids::NUMBERSEQUENCE_RANGE_1 | ids::NUMBERSEQUENCE_RANGE_2 => Some("Range"),
-            ids::NUMBERSEQUENCE_RESTART_1 => Some("Restart"),
-            _ => None,
-        };
-        let Some(method) = method else {
+        let Some(method) = number_sequence_method(id) else {
             return unsupported(format!("builtin {id}"));
         };
         // The position of the optional CompanySpecific argument per overload.
@@ -440,6 +375,7 @@ impl Session {
             _ => 1,
         };
         let key = self.sequence_key(args, scope)?;
+        self.note_footprint_sequence(method, &key);
         let name = key.1.clone();
         // session-system/TestNumberSequenceRuntimeContracts.al:NumberSequence_MissingSequence_Texts: the name is
         // quoted and the code is `AL`.
@@ -463,14 +399,12 @@ impl Session {
                         "Sql:Sql",
                     );
                 }
-                self.sequences.insert(
-                    key,
-                    Sequence {
-                        increment,
-                        seed,
-                        last: None,
-                    },
-                );
+                let sequence = Sequence {
+                    increment,
+                    seed,
+                    last: None,
+                };
+                self.insert_sequence(key, sequence);
                 Ok(Value::Null)
             }
             "Exists" => Ok(Value::Boolean(self.sequences.contains_key(&key))),
@@ -652,6 +586,7 @@ impl Session {
         self.check_unmeasured_key(&scope, &key)?;
         // A key that matches a stored key only without their trailing spaces (isolated_storage_reads.rs `trailing_twin`).
         let slot = self.trailing_twin(method, scope, &key)?;
+        self.note_footprint_storage(method, &slot);
         let found = self.ret_used;
         match method {
             "Set" | "SetEncrypted" => {
@@ -931,5 +866,19 @@ impl Session {
             }
             _ => return None,
         })
+    }
+}
+
+/// The NumberSequence method of session builtin `id`; `None`: another builtin.
+pub(crate) fn number_sequence_method(id: al_ir::BuiltinId) -> Option<&'static str> {
+    match id {
+        ids::NUMBERSEQUENCE_CURRENT_1 => Some("Current"),
+        ids::NUMBERSEQUENCE_DELETE_1 => Some("Delete"),
+        ids::NUMBERSEQUENCE_EXISTS_1 => Some("Exists"),
+        ids::NUMBERSEQUENCE_INSERT_1 => Some("Insert"),
+        ids::NUMBERSEQUENCE_NEXT_1 => Some("Next"),
+        ids::NUMBERSEQUENCE_RANGE_1 | ids::NUMBERSEQUENCE_RANGE_2 => Some("Range"),
+        ids::NUMBERSEQUENCE_RESTART_1 => Some("Restart"),
+        _ => None,
     }
 }

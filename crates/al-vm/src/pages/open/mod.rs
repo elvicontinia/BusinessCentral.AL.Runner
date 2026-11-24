@@ -1,4 +1,8 @@
 //! Opening, closing, tree repeaters, landing on a row and part links of a page (`Session` methods).
+//!
+//! Opening and closing a page, rows loaded on open. Submodules: `page_open`, `close`, `landing`,
+//! `or_group`, `part_links`, `record_refusals`, `saved_row`, `temp_list_key`, `tree`, `values`. Entry
+//! points: `page_open`, `open_page_as` (page_open.rs), `page_close`, `close_with` (close.rs).
 
 use super::*;
 
@@ -16,7 +20,9 @@ mod plain_first;
 mod query_close_unhandled;
 mod record_refusals;
 mod repeater_new_line;
+mod saved_row;
 pub(in crate::pages) use repeater_new_line::RepeaterLine;
+pub(crate) use saved_row::SavedRow;
 mod temp_list_key;
 mod temp_navigate_new;
 mod temp_ws_preloaded;

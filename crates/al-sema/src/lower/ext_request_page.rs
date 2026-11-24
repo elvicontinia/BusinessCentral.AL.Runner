@@ -11,6 +11,13 @@
 //!
 //! Triggers on the extension's request page are pinned for one shape only (`pinned_request_page`); every other one stays
 //! refused.
+//!
+//! The request page of a report whose reportextensions change the run: why the client cannot drive it
+//! (`reasons`) and the one shape with OnOpenPage and OnClosePage on the base's and the extensions'
+//! request pages that the corpus pins, two independent apps (`pinned_request_page`, al-runner issue 7358);
+//! its order reaches the linked page through `DrivenCtx::request_page_order`, and it marks the
+//! report `ir::Report::request_page_ok_only` for the VM's call gate (al-vm
+//! `pages/request_ok_only.rs`). Entry points: `pinned_request_page`, `reasons`.
 
 use crate::workspace::{ObjKind, Resolution, Workspace};
 use al_ir as ir;
@@ -48,7 +55,7 @@ pub(crate) fn pinned_request_page(
     if a != b || a.len() != 2 {
         return None;
     }
-    let order = super::ext_order::report_extension_order(ws, changing).ok()?;
+    let order = super::ext_order::report_extension_order(ws, oi, changing).ok()?;
     if !order.independent_pair {
         return None;
     }

@@ -1,4 +1,7 @@
 //! `al-runner`: the user command line of AL Runner v3 (ADR-016). Today: `al-runner test`.
+//!
+//! The `al-runner` binary: runs on a thread with a large stack, maps results to exit codes. Entry
+//! points: `main`.
 
 mod affected;
 mod app_secrets;
@@ -14,6 +17,7 @@ mod demotool;
 mod dev_endpoint_ui;
 mod impact;
 mod impact_index;
+mod kept_apps;
 mod matrix;
 mod memory_budget;
 mod output;
@@ -56,6 +60,8 @@ fn write_permission_shadow(path: &std::ffi::OsStr) {
 }
 
 fn main() -> ExitCode {
+    // Keep the executable open from the start: the build hash of the compile cache is made later (issue 8691).
+    let _ = al_testrun::compile_cache::pin_running_executable();
     let shadow = std::env::var_os("AL_PERMISSION_SHADOW");
     if shadow.is_some() {
         al_builtins::permission_shadow::enable();

@@ -16,6 +16,15 @@
 //!
 //! One exception, for the PDF only (owner decision 2026-11-12): a read that stays inside the bytes the corpus pins at the start of
 //! BC's PDF answers ([`pdf_read`], [`PDF_PREFIX`]).
+//!
+//! the mark of a placeholder report output (ADR-040 amendment 2026-11-11): presence and byte copies
+//! answer, every read of the content is refused; the size is `Value::PlaceholderSize`, which answers
+//! only a comparison with 0; a record field may hold it, with the number type of its slot, and
+//! `size_read` refuses a platform read of such a field (amendment 2026-11-12b; the store refuses a
+//! filter or sort on it in al-data `MemStore::unknown_read`); a comparison `size_order` refused that
+//! a caller turned into an answer (a page's row compare) is refused at the next builtin call or the
+//! end of the procedure (`UNANSWERED`). Entry points: `mark`, `is_placeholder`, `refusal`, `size`,
+//! `size_order`, `size_read`, `size_guard`, `refuse_unanswered`.
 
 use std::cmp::Ordering;
 use std::sync::Arc;
@@ -59,6 +68,7 @@ pub fn refusal(mark: &str) -> Signal {
     } else {
         ""
     };
+    let mark = crate::rendered_text::shown(mark);
     Signal::unsupported(format!(
         "a read of the content of {mark} (the runtime writes a placeholder, not BC's rendering: only that the output \
          exists and is not empty{pinned} matches BC; a test that reads the content tests the layout renderer)"
@@ -123,6 +133,10 @@ pub fn pdf_read(v: &Value, read: PdfRead) -> Option<Result<PdfAnswer, Signal>> {
     let crate::value::LibraryValue::InStream(s) = &mut *g else {
         return None;
     };
+    // Most streams hold no mark: they are answered before the buffer handle is cloned (every Read of a byte passes here).
+    if !of(&s.live_blob()?.borrow()).is_some_and(|m| is_pdf(m)) {
+        return None;
+    }
     let blob = s.live_blob()?.clone();
     let buf = blob.borrow();
     let mark = of(&buf).filter(|m| is_pdf(m))?.clone();
@@ -165,6 +179,7 @@ pub fn size(mark: &Arc<str>) -> Value {
 static SIZE_MADE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 /// Whether [`size_guard`] can find a size (see [`SIZE_MADE`]).
+#[inline]
 pub fn sizes_made() -> bool {
     SIZE_MADE.load(std::sync::atomic::Ordering::Relaxed)
 }
@@ -224,6 +239,7 @@ pub fn size_refusal(mark: &str, what: &str) -> Signal {
 
 /// The text of [`size_refusal`].
 pub fn size_refusal_text(mark: &str, what: &str) -> String {
+    let mark = crate::rendered_text::shown(mark);
     format!(
         "{what} of the byte size of {mark} (BC's rendering is only known not to be empty: only a comparison of the size with 0 \
          answers)"

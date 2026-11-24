@@ -17,6 +17,16 @@ fn skip_after_timeout_is_off_by_default_and_a_flag_of_test_and_serve() {
     }
 }
 
+#[test]
+fn stop_after_first_failure_is_off_by_default_and_a_flag_of_test_and_serve() {
+    assert!(!test_args("test A").stop_after_first_failure);
+    assert!(test_args("test A --stop-after-first-failure").stop_after_first_failure);
+    match p("serve --protocol 2 --stop-after-first-failure").unwrap() {
+        Command::Serve(d) => assert_eq!(d, ["--stop-after-first-failure"]),
+        other => panic!("{other:?}"),
+    }
+}
+
 fn test_args(s: &str) -> TestArgs {
     match p(s).unwrap() {
         Command::Test(a) => *a,
@@ -56,13 +66,6 @@ fn stability_takes_an_existing_file_of_any_name_but_never_a_folder() {
 fn strict_order_is_opt_in() {
     assert!(!test_args("test A").strict_order);
     assert!(test_args("test A --strict-order").strict_order);
-}
-
-/// ADR-066 amendment 7 (owner, 2026-11-08): no replay cap unless `--max-replay N` is given.
-#[test]
-fn max_replay_is_opt_in() {
-    assert_eq!(test_args("test A").max_replay, None);
-    assert_eq!(test_args("test A --max-replay 50").max_replay, Some(50));
 }
 
 /// Issue 7143: `--allow-write-in-try-functions` is off unless given.
@@ -700,6 +703,27 @@ fn test_data_takes_an_optional_backup_path_that_cannot_be_mistaken_for_an_app() 
     // Test data is on by default, so a company can be named without --test-data.
     let a = test_args("test A --test-data-company X");
     assert!(!a.no_test_data && a.test_data_company.as_deref() == Some("X"));
+    let a = test_args("test A --test-data-company Main --test-data-company Other");
+    assert_eq!(a.test_data_company.as_deref(), Some("Main"));
+    assert_eq!(a.additional_test_data_companies, vec!["Other"]);
+    assert!(p("warm x.bak --test-data-company A --test-data-company B").is_err());
+}
+
+#[test]
+fn selected_backup_companies_must_match_the_companies_option() {
+    let args = "test A --test-data backup.bak --test-data-company TP --test-data-company ProbeCo";
+    assert!(p(&format!("{args} --companies TP,ProbeCo")).is_ok());
+    for options in ["--companies ProbeCo,TP", "--companies TP,Other", "--companies all"] {
+        let err = p(&format!("{args} {options}")).unwrap_err();
+        assert!(err.contains("company selection"), "{options}: {err}");
+    }
+
+    let err = p("test A --test-data backup.bak --test-data-company TP --test-data-company tp").unwrap_err();
+    assert!(err.contains("selected more than once"), "{err}");
+
+    let err = p("test A --test-data backup.bak --companies all --test-data-company TP --test-data-company ProbeCo")
+        .unwrap_err();
+    assert!(err.contains("--companies all"), "{err}");
 }
 
 #[test]
@@ -747,6 +771,11 @@ fn test_data_is_on_unless_no_test_data_turns_it_off() {
         p("test A --no-test-data --test-data-company X")
             .unwrap_err()
             .contains("--no-test-data")
+    );
+    assert!(
+        p("test A --company-data package --test-data-company Main --test-data-company Other")
+            .unwrap_err()
+            .contains("needs a database backup")
     );
 }
 

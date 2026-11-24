@@ -206,7 +206,7 @@ impl Session {
             None if modal => {
                 // BC refuses a dialog nobody answers, after it opened (NoHandler_Tests.al arms 7 and 8).
                 self.mark_closed(&target_state);
-                let id = obj.id.unwrap_or(0);
+                let id = crate::object_ids::declared_id(obj.id)?;
                 // Code: testpage/TestPageRunObjectContracts.al:228-240.
                 Err(error_code(
                     format!("TestPages that are invoked from a RunObject action must have a handler. Page No. = {id}"),
@@ -450,7 +450,7 @@ impl Session {
             }
         }
         if let Some(link) = &ro.link {
-            for entry in &link.entries {
+            for (at, entry) in link.entries.iter().enumerate() {
                 // `field(filter(F))`: the host's value as a filter text in filter group 0, no filter when it is blank
                 // (pages/link-filter/Y37LinkFilterTests.al:357-383 `LL.open f0=[No.: A1|A3]`).
                 if let ir::LinkEntry::FieldFilter(pf, hf) = entry {
@@ -501,6 +501,10 @@ impl Session {
                         }
                     }
                     ir::LinkEntry::Filter(pf, text) => {
+                        // Not blank (assumption link-filter-not-blank, corpus PR 1548).
+                        if link.not_blank.contains(&at) {
+                            al_builtins::assumptions::assume(al_builtins::assumptions::Assumption::LinkFilterNotBlank);
+                        }
                         // An empty term selects the rows whose field is blank (testpage/AoTests.al:513-560 RunPageLink, :845-887
                         // SubPageLink).
                         let ty = table.fields[*pf].ty.clone();

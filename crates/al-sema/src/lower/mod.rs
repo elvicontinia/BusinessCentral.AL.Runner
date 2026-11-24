@@ -1,6 +1,10 @@
 //! Lowering resolved syntax to the typed IR (ADR-011). Anything the IR or the
 //! builtins registry cannot express yet becomes a reason on the routine
 //! (`Routine::unsupported` in `Lowered`), never a guess.
+//!
+//! Lowers resolved syntax to the typed IR (ADR-011). Anything inexpressible becomes a refusal reason
+//! on the routine. Holds `Lowered`, the `Lowerer` state and the module list. Entry points: `Lowered`,
+//! `Lowerer`.
 
 use crate::check::posmap::FxMap as HashMap;
 use crate::check::{CheckResult, Res};
@@ -35,6 +39,9 @@ pub struct Lowered {
     /// Per object, per routine: where the statement is that gave the routine's first reason in `unsupported`, when a
     /// statement gave it (`--explain` points at it; al-runner issue 6061). Empty for an object a compile cache supplied.
     pub refusal_at: Vec<Vec<Option<ir::SrcPos>>>,
+    /// Per object: a call of its code had no callee the checker resolved (`Lowerer::unresolved_call`). The incremental
+    /// compile cannot tell which object such a call reaches after a declaration changes (`incremental::readers`).
+    pub(crate) unresolved_calls: Vec<bool>,
     /// Per object, per routine: the routines it calls directly, as (object, routine).
     pub calls: Calls,
     /// Per object: it belongs to a dependency app, so no test or install code of it runs (ADR-013).
@@ -256,6 +263,9 @@ pub(crate) struct Lowerer<'a> {
     /// The local variables of the routine whose declaration writes `Char`, `Byte`, or `Option` with named members, by
     /// lowercase name (`char_option_byte_get`). A parameter, a return value and a platform option type are not among them.
     local_char_option_byte_vars: std::collections::HashSet<String>,
+    /// Every variable of the routine's `var` section, by lowercase name; a parameter and a return value are not among them
+    /// (the `for` loop bounds of `for-char-literal-bounds` measured only such locals).
+    local_var_section_names: std::collections::HashSet<String>,
     /// Declared text of Label variables, by lowercase name; reads lower to that constant.
     global_labels: HashMap<String, String>,
     local_labels: HashMap<String, String>,
@@ -294,6 +304,8 @@ pub(crate) struct Lowerer<'a> {
     reasons: Vec<String>,
     /// Where the statement is that gave the routine's first reason, when one did (`--explain`, al-runner issue 6061).
     refusal_at: Option<ir::SrcPos>,
+    /// A call of the object had no callee the checker resolved (`Lowered::unresolved_calls`).
+    unresolved_call: bool,
     calls: Vec<(usize, usize)>,
     /// Per object: why the test client cannot drive it yet (pages).
     page_reasons: &'a [Vec<String>],
@@ -357,8 +369,9 @@ pub(crate) struct Lowerer<'a> {
     emit_pos: bool,
     /// Index of the routine being lowered in its object.
     routine_idx: usize,
-    /// The assumptions the lowering of each statement being lowered rests on (innermost last).
-    assumed: Vec<Vec<al_builtins::assumptions::Assumption>>,
+    /// The assumptions the lowering of each statement being lowered rests on (innermost last); `res` notes the ones the check
+    /// recorded on a name (`Res::Assumed`).
+    assumed: std::cell::RefCell<Vec<Vec<al_builtins::assumptions::Assumption>>>,
     /// `--tdd` (ADR-051 decision 10): the stub declarations each statement being lowered uses (innermost last); `res`
     /// notes them, so a `Stmt::TddMark` goes before the statement.
     tdd_marked: std::cell::RefCell<Vec<Vec<String>>>,
@@ -631,6 +644,7 @@ mod expr;
 mod ext_order;
 mod ext_request_page;
 mod extend;
+mod setrange_written;
 
 #[cfg(test)]
 mod abp_refusal_tests;
@@ -642,6 +656,8 @@ mod pages;
 mod request_procs;
 mod returned_record;
 mod routine_lists;
+#[cfg(test)]
+mod setrange_written_tests;
 mod shared;
 mod stmt;
 mod table_no_rec;

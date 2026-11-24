@@ -11,6 +11,9 @@
 //! in .NET.
 //!
 //! `ALRUNNER_NO_INPROC=1` leaves the sidecar alone: `wrap` returns the host it was given.
+//!
+//! In-process stand-ins for a closed set of .NET members in front of the sidecar (ADR-038), the list
+//! in `inproc.txt`. Entry points: `wrap`, `InprocHost`, `InprocSession`.
 
 use crate::dotnet::*;
 use md5::Md5;
@@ -298,7 +301,7 @@ pub fn from_base64(s: &str) -> Option<Vec<u8>> {
 
 /// `Byte.ToString(format)` and `Int32.ToString(format)` for the formats D, d, X, x with an optional precision of up to
 /// two digits and no format at all. Anything else is left to .NET.
-fn format_integer(v: i64, unsigned_bits: Option<u32>, format: Option<&str>) -> Option<String> {
+fn format_integer(v: i64, format: Option<&str>) -> Option<String> {
     let Some(f) = format else {
         return Some(v.to_string());
     };
@@ -317,7 +320,6 @@ fn format_integer(v: i64, unsigned_bits: Option<u32>, format: Option<&str>) -> O
         }
         'X' | 'x' => {
             let bits = if v < 0 { v as u32 as u64 } else { v as u64 };
-            let _ = unsigned_bits;
             let s = if kind == 'X' {
                 format!("{bits:X}")
             } else {
@@ -420,8 +422,8 @@ impl InprocSession {
                     Some(_) => return None,
                 };
                 let text = match v {
-                    DotNetValue::Byte(b) => format_integer(i64::from(*b), Some(8), format)?,
-                    DotNetValue::Int32(i) => format_integer(i64::from(*i), None, format)?,
+                    DotNetValue::Byte(b) => format_integer(i64::from(*b), format)?,
+                    DotNetValue::Int32(i) => format_integer(i64::from(*i), format)?,
                     _ => return None,
                 };
                 Some(Ok(DotNetReply::value(DotNetValue::Str(text))))

@@ -9,6 +9,11 @@
 //! The codeunit reads its resource files (`DemoDataConfig.xml`, pictures, text files) through the `File` type, by paths
 //! relative to the server's user folder, where BCApps' script copies them. [`ResourceFiles`] serves them from one
 //! folder, read-only; what the codeunit writes (its log file) stays in memory.
+//!
+//! A company built by a dependency codeunit in the baseline (`--company-data demotool`):
+//! `CompanyData` (codeunit, resources, key text), `ResourceFiles` (read-only resource folder matched
+//! without case, writes in memory), the blocked note that leaves every test not run
+//! (`Engine::company_refusal`). Entry points: `CompanyData`, `ResourceFiles`, `blocked`.
 
 use al_host::{FileSystem, MemFileSystem};
 use std::collections::BTreeSet;
@@ -321,7 +326,7 @@ impl FileSystem for ResourceFiles {
     /// Only a folder AL code created in the temporary folder: the files written directly in it, in name order without case,
     /// each as the folder joined with `/` to the file name as first written (the same join as `staged_folder_files`, for the
     /// runtime's .NET System.IO.Path). Windows BC 29.0 lists the files MediaSet.ExportFile wrote there (windows-check-results
-    /// 2026-10-23 RJ item B; corpus tests/al-language-onprem/streams/media/MediaFiles.al:772, RJ_MediaSet_ExportFile_ConfigPackageShape,
+    /// 2026-10-23 RJ item B; corpus tests/al-language-onprem/streams/media/MediaFiles.al:776, RJ_MediaSet_ExportFile_ConfigPackageShape,
     /// cu 61286) and lists every folder in name order without case, never in creation order (windows-check-results 2026-10-23
     /// listing order, cu 61287 LO_ListingOrder: created a,C,b lists a,b,C; B,a lists a,B). The names compare upper-cased, as
     /// NTFS orders its entries. Corpus bump 62 pins this order; until it lands the caller marks

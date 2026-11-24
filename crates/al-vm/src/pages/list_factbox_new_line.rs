@@ -1,8 +1,6 @@
 //! A top-level List page's CardPart FactBox, linked to the list's key, around the list's new line (al-runner issue 8188).
 //!
-//! Corpus pull request 1426 (merged, not pinned yet), tests/al-language/pages/parts/ListHostFactBoxNewLine.al, measured on
-//! Business Central 29.1 and green on every supported major in its CI, runs only through the assumption `list-factbox-new-line`.
-//! On its List page (:28-62) with one CardPart FactBox (:64-90), BC:
+//! Pinned by pages/parts/ListHostFactBoxNewLine.al:158-202 (the same on every supported major). On its List page (:28-62) with one CardPart FactBox (:64-90), BC:
 //! - opens an empty view with the part's OnAfterGetCurrRecord on the blank record (:162 `open=F.AGCR();`);
 //! - runs nothing at `New()` below the view's one row: the part keeps showing that row (:181 `new=`, `partnew=Alpha`);
 //! - on the SetValue of the key of the new line runs the part's OnAfterGetCurrRecord on the blank record, twice after such a
@@ -12,20 +10,34 @@
 //! - on the `Next()` after it, onto the new line, runs the part's OnAfterGetCurrRecord on the blank record (:183
 //!   `next2log=F.AGCR();`).
 //!
-//! Corpus pull request 1425 (merged, not pinned yet), tests/al-language/pages/currpage/ListNewLineCodeInsertUpdate.al, shows the same at the
+//! pages/currpage/ListNewLineCodeInsertUpdate.al shows the same at the
 //! open, `New()` and these moves on another host (two CardPart FactBoxes on a two-field key, AutoSplitKey, a control's
 //! OnValidate; :713-740 `open=F.AGCR();`, `newparts=A/`, `nextlog=F.AGR(X);F.AGCR(X);`, `nextlog=T.M(X/V);F.AGCR();`), which
-//! this module does not admit.
+//! this module does not admit: its open refuses (`code_inserted_new_line.rs` `refuse_code_inserted_parts_host`).
 //!
 //! Each step runs only on the probe's page shapes (`factbox_line_pages`) and after the probe's earlier steps
 //! (`FactboxLine`, `steps_are`); everything else keeps the path it had, and a SetValue that raises an error ends the steps. After
 //! a `New()` that kept the part, the host's reads and property calls, a key's SetValue the probe does not make and Close keep
 //! main's answers; a call that reads or moves the part otherwise, an action, another SetValue or a move of the host is refused
 //! (`factbox_line_call`).
+//!
+//! A top-level List page's CardPart FactBox, linked to the key, around the new line (al-runner issue
+//! 8188, pages/parts/ListHostFactBoxNewLine.al): on the probe's page shapes only
+//! (`factbox_line_pages`) and after the probe's earlier steps (`FactboxLine` on
+//! `PageState::factbox_line`, `steps_are`), the open of an empty view, the key's SetValue on the new
+//! line and the Next onto it run the part's OnAfterGetCurrRecord on the blank record
+//! (`with_blank_landing`, read by `factbox_blank_landing` in `open/landing.rs`); New() below the
+//! view's one row leaves the part on that row until the key's SetValue (`sync_parts_after_new`,
+//! `factbox_line_call`: the host's reads and property calls, Close and a key's SetValue the probe
+//! does not make keep main's answers, `release_held_part`; the other calls are refused); Next back
+//! onto the row the line saved finds it among the rows the host holds (`next_back_held`). Entry
+//! points: `sync_parts_at_list_open` (by `open/page_open.rs`), `sync_parts_after_new` (by
+//! `pageops.rs`), `factbox_line_call` (by `page_op_inner`), `resync_parts_after_set_value` (by
+//! `controls.rs`), `sync_parts_after_host_step` (by `fn_controls.rs`), `factbox_line_after_set_value`
+//! (by `pageops.rs`: a SetValue that raised an error ends the steps).
 
 use super::pinned_shape::{PinnedCode, TestCall, code_stmts, rec_text_log_call};
 use super::*;
-use al_builtins::assumptions::{Assumption, assume};
 use al_builtins::page_op::{PageMethod, PageOp, PageRecv};
 
 /// The last measured step of the host's FactBox around the new line (`PageState::factbox_line`). Each step requires the one
@@ -230,7 +242,7 @@ impl Session {
     }
 
     /// Runs `read` (a read of the parts of host `host`) with `PageState::factbox_blank_landing` on.
-    fn with_blank_landing(
+    pub(super) fn with_blank_landing(
         &mut self,
         host: &St,
         read: impl FnOnce(&mut Self) -> Result<(), Signal>,
@@ -251,12 +263,15 @@ impl Session {
     /// The parts of host `st` read as the host opens; on an empty view of the probe's pages the part runs OnAfterGetCurrRecord
     /// on the blank record (:162 `open=F.AGCR();`, `part=`).
     pub(super) fn sync_parts_at_list_open(&mut self, st: &St) -> Result<(), Signal> {
+        self.refuse_code_inserted_parts_host(st)?;
         let empty =
             Self::on_untouched_line(st) && self.factbox_line_pages(st)?.is_some() && self.view_row_count(st)? == 0;
         if !empty {
+            if self.coded_open_on_empty_view(st)? {
+                return Ok(());
+            }
             return self.sync_parts_at_open(st);
         }
-        assume(Assumption::ListFactboxNewLine);
         self.with_blank_landing(st, |s| s.sync_parts_at_open(st))?;
         st.borrow_mut().factbox_line = FactboxLine::EmptyOpen;
         Ok(())
@@ -266,7 +281,6 @@ impl Session {
     /// as the first call but reads, the part keeps that row and reads nothing (:181 `new=`, `partnew=Alpha`).
     pub(super) fn sync_parts_after_new(&mut self, st: &St, new_from_row: bool) -> Result<(), Signal> {
         if new_from_row && self.new_holds_factbox(st)? {
-            assume(Assumption::ListFactboxNewLine);
             st.borrow_mut().factbox_line = FactboxLine::Held;
             return Ok(());
         }
@@ -353,7 +367,6 @@ impl Session {
                 if !self.held_key_measured(&root, *i, args)? {
                     return self.release_held_part(&root);
                 }
-                assume(Assumption::ListFactboxNewLine);
                 root.borrow_mut().factbox_line = FactboxLine::HeldRead;
                 let before = self.host_new_running.replace(true);
                 let r = self.with_blank_landing(&root, |s| s.sync_parts(&root));
@@ -477,7 +490,6 @@ impl Session {
             }
             return self.resync_parts_linked_by(st, idx, before);
         }
-        assume(Assumption::ListFactboxNewLine);
         self.with_blank_landing(st, |s| s.resync_parts_linked_by(st, idx, before))?;
         st.borrow_mut().factbox_line = FactboxLine::Keyed;
         Ok(())
@@ -525,7 +537,6 @@ impl Session {
         let Some(saved) = self.neighbor_row(&rec, 1)?.filter(|_| held_here) else {
             return Ok(());
         };
-        assume(Assumption::ListFactboxNewLine);
         let table = self.table(&rec)?;
         st.borrow_mut().window.push(crate::pages::WindowRow {
             key: table.primary_key(&saved),
@@ -555,7 +566,6 @@ impl Session {
             return self.sync_parts_after_move(st, name == PageMethod::Previous);
         }
         st.borrow_mut().factbox_line = FactboxLine::Off;
-        assume(Assumption::ListFactboxNewLine);
         self.with_blank_landing(st, |s| s.sync_parts_after_move(st, false))
     }
 }

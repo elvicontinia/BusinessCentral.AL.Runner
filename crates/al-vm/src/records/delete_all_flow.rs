@@ -37,7 +37,7 @@ impl Session {
                     .into(),
             ));
         }
-        let (filters, _) = self.split_filters(rec);
+        let (filters, _) = self.split_filters(rec)?;
         self.coverage_cleared(t, temporary, &filters);
         if !temporary {
             self.global_setup_asked(t)?;
@@ -75,7 +75,9 @@ impl Session {
         shared: &al_builtins::value::TableGlobals,
         run: bool,
     ) -> Result<(), Signal> {
-        let mut st = state_with_fields(rec, row);
+        let mut row = row;
+        crate::sqltime::read_back(&mut row);
+        let mut st = state_with_fields(rec, row.into());
         st.filters.clear();
         st.globals = shared.share();
         self.delete_row(t, &Rc::new(RefCell::new(st)), run)?;

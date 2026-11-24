@@ -1,6 +1,8 @@
 //! `Delete` of one row with what it takes along (`delete_one`). `DeleteAll`: the rows it deletes, row by row (with delete
 //! events, database triggers, OnDelete for DeleteAll(true), the User table, MarkedOnly) or in one step in the store; a filter
 //! on a FlowField goes to `delete_all_flow`.
+//!
+//! `DeleteAll`, row by row or in one step in the store.
 
 use super::*;
 
@@ -52,7 +54,7 @@ impl Session {
         reset: bool,
     ) -> Result<Value, Signal> {
         self.tenant_set_truncate(cx, t, rec)?;
-        self.note_bulk_write(rec, t, crate::state::TxWriteKind::Truncate);
+        self.note_bulk_write(rec, t, crate::state::TxWriteKind::Truncate, &[]);
         self.truncate(t, rec, reset)
     }
 
@@ -64,7 +66,7 @@ impl Session {
         cx: &al_data::AccessContext,
         run: bool,
     ) -> Result<Value, Signal> {
-        let (filters, flow_field_filters) = self.split_filters(rec);
+        let (filters, flow_field_filters) = self.split_filters(rec)?;
         if !flow_field_filters.is_empty() {
             return self.delete_all_flow_filtered(t, rec, run);
         }
@@ -72,7 +74,7 @@ impl Session {
         self.coverage_cleared(t, temporary, &filters);
         // The platform asks for the table's Global Triggers setup, as the first write to the table, before it looks
         // for rows: a row the setup subscriber inserts is deleted (events/W4GlobalTriggers.al:327, :341), and a table
-        // with no row asks too (session-system/TestEnvironmentUserTenantContracts.al:289-290, `GtTable.DeleteAll()` on an
+        // with no row asks too (session-system/TestEnvironmentUserTenantContracts.al:286-287, `GtTable.DeleteAll()` on an
         // empty table). A temporary record is not pinned and stays as it was.
         if !temporary {
             self.global_setup_asked(t)?;
@@ -167,7 +169,9 @@ impl Session {
                     // record/crud/DeleteAllSkipsDeleted.al:DeleteAllTrue_FirstDeletesAnEarlierSibling_NoneEarlier.
                     continue;
                 }
-                let mut st = state_with_fields(rec, row);
+                let mut row = row;
+                crate::sqltime::read_back(&mut row);
+                let mut st = state_with_fields(rec, row.into());
                 st.filters.clear();
                 st.globals = shared.share();
                 self.delete_row(t, &Rc::new(RefCell::new(st)), run)?;

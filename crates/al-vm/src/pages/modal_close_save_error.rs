@@ -20,6 +20,16 @@
 //! A new row's insert at close (:398 measures one, but the runtime inserts the row at SetValue and no corpus case shows when a
 //! List without DelayedInsert inserts it in a TestPage), a Document or any page with parts (pages/close-errors/CemDocumentTests.al
 //! pins another error there), another error code and every other page type keep the refusal.
+//!
+//! The platform's close of a modal page a ModalPageHandler returned from without closing, when the
+//! save of the edited row raises (al-runner issue 7400; pages/close-errors/CemModalHandlerTests.al):
+//! on a Card or a List without parts saving an existing row RunModal fails with the error's text and
+//! the code TestWrapped, a TestField error keeps its code after a second save
+//! (ModalCloseSaveErrorShapes.al); a Worksheet and a LookupMode Page variable for Error() only; the
+//! TestField only when the page's own code or a codeunit raised it (`Session::error_raised_in`), not
+//! a table trigger; a static `Page.RunModal` counts only with a record
+//! (`PageState::static_run_record`); other shapes are refused. Entry points: `close_modal_left_open`
+//! (by `answer_page`).
 
 use super::*;
 
@@ -127,10 +137,10 @@ impl Session {
         // How the page was run. Every pinned static `Page.RunModal` passes a record (ModalCloseSaveErrorShapes.al:258, :321,
         // :343, :384; CemModalHandlerTests.al: all 66 calls are `Page.RunModal(Id, Row)`); one without a record is no pinned
         // shape and keeps the refusal.
-        let run = match (s.run_static, s.static_run_record, s.lookup.then_some(s.lookup_kind)) {
-            (Some(true), true, Some(LookupKind::StaticRunModal)) => Run::StaticRecordUsed,
-            (Some(true), true, None) => Run::StaticRecordStatement,
-            (Some(true), ..) => return None,
+        let run = match (s.modal_run, s.static_run_record, s.lookup.then_some(s.lookup_kind)) {
+            (ModalRun::Static, true, Some(LookupKind::StaticRunModal)) => Run::StaticRecordUsed,
+            (ModalRun::Static, true, None) => Run::StaticRecordStatement,
+            (ModalRun::Static, ..) => return None,
             (_, _, None) => Run::NoLookup,
             (_, _, Some(LookupKind::Variable)) => Run::VariableLookup,
             _ => return None,

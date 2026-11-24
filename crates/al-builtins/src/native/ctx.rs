@@ -132,6 +132,11 @@ pub trait Ctx: FormatCtx {
     }
 
     fn last_error(&self) -> AlError;
+    /// The code runs in a session that started with no error and has had none since, a page background task's worker
+    /// (`GetLastErrorObject` answers null there); a context that does not know answers `false`.
+    fn session_without_error(&self) -> bool {
+        false
+    }
     fn set_last_error(&mut self, e: AlError);
     /// Whether the run has the newer behaviour of `gate` (ADR-015 3.4); a context with no target has every gate.
     fn gate(&self, _gate: al_version::Gate) -> bool {
@@ -159,6 +164,11 @@ pub trait Ctx: FormatCtx {
     /// into the field as `FieldRef.Validate` converts it.
     fn record_validate_variant(&mut self, rec: Option<&mut Value>, args: &mut [Value]) -> Result<Value, Signal> {
         self.record(crate::record_op::RecordOp::Validate, rec, args)
+    }
+    /// `Record.SetRange(Field, V)` with `V` written as a Variant (lowering picks `Record.SetRangeVariant#1`): a value of another
+    /// type than the field's converts as al-vm `setrange_convert` says.
+    fn record_setrange_variant(&mut self, rec: Option<&mut Value>, args: &mut [Value]) -> Result<Value, Signal> {
+        self.record(crate::record_op::RecordOp::SetRange, rec, args)
     }
     /// `TestPage` / `TestField` / `TestAction` methods: the VM's test client
     /// implements them (ADR-012). `method` is `Receiver.Name`.
@@ -224,6 +234,11 @@ pub trait Ctx: FormatCtx {
     /// table's fields. `None` where the context has no program.
     fn format_composite(&mut self, _v: &Value) -> Option<Result<String, Signal>> {
         None
+    }
+    /// `Format` of a `FieldRef` with standard format 1, 2 or 9 is about to read the field's value: the context refuses a read
+    /// `Format` may not make there.
+    fn format_fieldref_read(&mut self, _fr: &Value) -> Result<(), Signal> {
+        Ok(())
     }
     /// `Format` of a `DotNet` object or enum: its `ToString()` (ADR-024). `None` where the context
     /// has no .NET host.

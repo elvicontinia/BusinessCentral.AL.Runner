@@ -3,6 +3,13 @@
 //! A routine's registers are its locals followed by temporaries. Instructions call the shared helpers of the VM. Every statement and expression of the IR has instructions: the
 //! compiler returns `None` only when a routine needs more registers than an instruction can name. A value capture runs
 //! the captured form (`compile(.., true)`), which adds the statement and loop instructions of ADR-030.
+//!
+//! , `exec/compile.rs`, `exec/run.rs`, `exec/types.rs`: The executable form (ADR-034), the only
+//! executor. `compile` turns a routine of the IR into a `Chunk` of register instructions
+//! (`compile(.., true)` is the captured form that value capture runs, ADR-030; `compile_debug` is the
+//! debug form, one `Op::DbgHit` after each `Op::Pos`, ADR-048); `run_range` is the loop; `types.rs`
+//! is the interface the typed instructions get their static types from. Entry points:
+//! `ExecProgram::chunk`, `captured_chunk`, `debug_chunk`, `compile`, `Session::run_chunk`.
 
 mod compile;
 mod run;
@@ -56,6 +63,8 @@ pub(crate) enum Op {
     StorePlace {
         p: u32,
         a: u16,
+        /// The source is a direct FieldRef.Value read and the destination is a record field.
+        fr: bool,
     },
     /// `place p := a`, `a` the value of a variable of the `var` section stored into an element of an array of memberless
     /// Options (`ir::Expr::VarSectionValue`, `Session::store_var_section`).
@@ -468,6 +477,9 @@ pub(crate) struct BuiltinSite {
     /// A registered native whose receiver and arguments are all values (nothing is written back) and that has no
     /// special handling in `run_builtin`: it runs on the short path (`Session::run_plain_builtin`).
     pub plain: bool,
+    /// `InStream.Read` or `OutStream.Write` on a local stream variable, with at most two arguments: that local. While it
+    /// holds a stream the call runs on the stream path (`Session::run_stream_builtin`), the native on the local in place.
+    pub stream_local: Option<u16>,
     /// When the call runs `Session::temp_blob_share_guard` first (`temp_blob_share::site_check`).
     pub temp_blob: crate::temp_blob_share::SiteCheck,
 }

@@ -9,10 +9,24 @@
 //!
 //! Step 1 round 1 moves today's cells into the table without changing an answer; the writing of the output stays in
 //! `report_placeholder`.
+//!
+//! `facts.rs` the fact vector and its words; one owner per group: `fact_report.rs` (default layout,
+//! declaration, data items, triggers, extensions), `fact_selection.rs` (layout selection, the stored
+//! row, rows naming the report and the temporary selection of A7, from the answers of
+//! SelectReportLayoutCode and SelectedBuiltinLayoutType raised to Base Application's
+//! ReportManagement; no read of table 9651), `fact_run.rs` (rows, `rgba(` in the dataset); `cell.rs`
+//! the row shape; `cells.rs` the rows with their corpus lines; `cells_decl.rs` the rows of a report
+//! whose `WordLayout` and `RDLCLayout` properties declare its layouts (corpus pull request 1381);
+//! `lookup.rs` the exact lookup (overlapping rows nest, the most specific answers), the miss reason
+//! (facts never measured, nearest rows) and the rgba reason; `events.rs` the layout-event subscribers
+//! that refuse; `errors.rs` the error texts; `mod.rs` `save_before_run` (called by `reports.rs`
+//! `report_save_as` and `pages/request.rs`), `save_after_run`, `format_unsupported_by_layout`,
+//! `refuse_run_layout_events`.
 
 mod cell;
 mod cells;
 mod cells_decl;
+mod cells_items;
 mod errors;
 mod events;
 mod fact_report;
@@ -171,7 +185,7 @@ impl Session {
                 match row.answer {
                     Answer::False(e) => Ok(BeforeRun::False(errors::error_of(
                         e,
-                        self.object_id_of(schema.object as u32),
+                        self.object_id_of(schema.object as u32)?,
                         format,
                     ))),
                     Answer::Refuse(why) => Err(Signal::unsupported(format!("{}, {why}", what(&facts, schema)))),
@@ -268,7 +282,7 @@ impl Session {
             Answer::FalseKeepError => Ok(AfterRun::Answer(false)),
             Answer::TrueNothing => Ok(AfterRun::Answer(true)),
             Answer::FalseAfterRun(e) => {
-                let error = errors::error_of(e, self.object_id_of(schema.object as u32), facts.format);
+                let error = errors::error_of(e, self.object_id_of(schema.object as u32)?, facts.format);
                 if !used {
                     return Err(Signal::Error(Box::new(error)));
                 }

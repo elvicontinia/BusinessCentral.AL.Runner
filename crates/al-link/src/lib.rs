@@ -7,6 +7,10 @@
 //! it unchanged.
 //!
 //! Core crate: no OS access (ADR-006).
+//!
+//! `link` for a whole program, `relink` for the incremental compile, `first_difference` for the
+//! `AL_CHECK_LINK` proof, `par_map` for the worker threads. Entry points: `link`, `relink`, `Unit`,
+//! `LinkError`.
 use al_ir::sym::{
     Contribution, ControlKey, EnumImplDecl, Expansion, FieldKey, FxMap, ImplSlot, ListKind, LocalKey, ObjKey,
     RoutineKey, SubscriberTarget, SymObject,
@@ -839,6 +843,7 @@ fn uncompiled_subscribers<S: Space + ?Sized>(
                 SubscriberTarget::CaptionClass => (2, 0, P::CaptionClass),
                 SubscriberTarget::ReportingTriggers => (3, 0, P::ReportingTriggers),
                 SubscriberTarget::FilterHelperTriggers => (4, 0, P::FilterHelperTriggers),
+                SubscriberTarget::UiHelperTriggers => (5, 0, P::UiHelperTriggers),
             };
             found.push((
                 group,
@@ -1158,9 +1163,11 @@ impl Merges {
             let Some(table) = obj.table.as_mut() else {
                 continue;
             };
-            let adds: Vec<al_ir::sym::TableContribution> =
-                exts.iter().filter_map(|&e| contributions[e].table.take()).collect();
-            for c in &adds {
+            let adds: Vec<(usize, al_ir::sym::TableContribution)> = exts
+                .iter()
+                .filter_map(|&e| contributions[e].table.take().map(|c| (e, c)))
+                .collect();
+            for (_, c) in &adds {
                 for (k, v) in &c.properties {
                     if k == al_ir::sym::UNSUPPORTED_TABLE_PROPERTY {
                         table.unsupported.push(v.clone());
@@ -1183,7 +1190,7 @@ impl Merges {
                     }
                 }
             }
-            for c in &adds {
+            for (e, c) in &adds {
                 for m in &c.modifies {
                     for f in table
                         .fields
@@ -1198,6 +1205,7 @@ impl Merges {
                     table.keys.push(k.fields.clone());
                     table.unique_keys.push(k.unique);
                     table.key_props.push(k.props.clone());
+                    table.key_declared_in.push(Some(*e as u32));
                 }
             }
         }
@@ -1800,6 +1808,7 @@ mod tests {
                     keys: vec![vec![0]],
                     unique_keys: vec![true],
                     key_props: vec![vec![]],
+                    key_declared_in: vec![None],
                     per_company: true,
                     extensions: vec![],
                     unsupported: vec![],
@@ -1885,10 +1894,13 @@ mod tests {
             expr_source: None,
             expr_row_unordered: false,
             expr_call: false,
+            rec_method_source: false,
             array_element: None,
             source_text: None,
             bare_quoted_ext_source: false,
+            visible_row_field: None,
             factbox: false,
+            fixed_or_grid: false,
         }
     }
 

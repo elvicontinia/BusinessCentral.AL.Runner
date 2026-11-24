@@ -4,6 +4,10 @@
 //! The model (see `al-host`): the session time zone is UTC, so `Today`, `Time` and
 //! `CurrentDateTime` are views of one clock reading each. `Sleep` does not wait; it moves the
 //! session's view of the clock forward, which is all AL can observe of a wait.
+//!
+//! Builtins that answer from the host (ADR-006), and the system field stamps of a write
+//! (`stamp_insert`, `stamp_modify`, `stamp_rename`). Entry points: `datetime_of_unix_millis`,
+//! `Replaced`.
 
 use crate::Session;
 use al_builtins::builtin_id::ids;
@@ -209,7 +213,7 @@ impl Session {
             ids::SYSTEM_TEMPORARYPATH_1 => Ok(Value::Text("\\TEMP\\".into())),
             ids::SYSTEM_WINDOWSLANGUAGE_1 => Ok(Value::Integer(self.host.identity.windows_language())),
             ids::SYSTEM_GLOBALLANGUAGE_1 => match args.first() {
-                None => Ok(Value::Integer(self.global_language)),
+                None => Ok(Value::Integer(self.global_language())),
                 // These ids raise NotSupportedLanguage and leave the language as it was
                 // (metadata/platform-tables/PlTSession.al:245-266, GlobalLanguage_InvalidIds: 0, -1, 99999;
                 // :326-360, GlobalLanguage_PositiveIds: 1000, 4096, 8192, 9999, 32767, 65535). Other ids are set as before.
@@ -222,14 +226,10 @@ impl Session {
                     ))
                 }
                 Some(Value::Integer(n)) if *n > 0 => {
-                    if self.global_language != *n {
+                    if self.global_language() != *n {
                         self.events.caption_context_revision += 1;
                     }
-                    self.global_language = *n;
-                    self.events.event_stats.language.set(*n);
-                    // A Code assignment under Turkish or Azerbaijani upper-cases `i` to `İ` (CaseConv.Codeunit.al:280-310).
-                    al_builtins::ops::set_turkic_code(al_builtins::native::is_turkic_language(*n));
-                    al_builtins::filter::set_filter_language(*n);
+                    self.set_language(*n);
                     Ok(Value::Null)
                 }
                 other => unsupported(format!(
@@ -237,11 +237,18 @@ impl Session {
                     other = other.describe()
                 )),
             },
-            // SelectLatestVersion drops what CaptionClassTranslate kept (types/PSCaptionClass.al:103-115); the session reads the
-            // store as it is, so there is nothing else to refresh.
-            ids::DATABASE_SELECTLATESTVERSION_1 | ids::DATABASE_SELECTLATESTVERSION_2 => {
+            // SelectLatestVersion drops what CaptionClassTranslate kept (types/PSCaptionClass.al:103-115). In a page background
+            // task's worker it also ends the query cache's row entries of the table, or of every table without one
+            // (`Session::note_select_latest_version`, open corpus PR 1495, BgTaskQueryCache.al:6730-6845).
+            // `#1` is SelectLatestVersion(), `#2` SelectLatestVersion(Table).
+            ids::DATABASE_SELECTLATESTVERSION_1 => {
                 self.caption_translations.clear();
+                self.note_select_latest_version(None);
                 Ok(Value::Null)
+            }
+            ids::DATABASE_SELECTLATESTVERSION_2 => {
+                self.caption_translations.clear();
+                self.note_select_latest_version_of(args.first()).map(|()| Value::Null)
             }
             // corpus types/PSCaptionClass.al:5-8, :58-81 (CaptionClassTranslate_Expressions).
             ids::SYSTEM_CAPTIONCLASSTRANSLATE_1 => match args.first().and_then(al_builtins::native::text_of) {
